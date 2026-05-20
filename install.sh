@@ -28,13 +28,21 @@ curl -fsSL \
   "$release_api_url" \
   -o "$release_json" || fail "Unable to fetch latest release metadata from GitHub"
 
+release_tag="$(
+  sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$release_json" | head -n 1
+)"
+release_version="${release_tag#v}"
+
 asset_url="$(
   sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\.vsix\)".*/\1/p' "$release_json" \
-    | awk '
+    | awk -v release_version="$release_version" '
+      release_version != "" && $0 ~ "/vscode-pdf-" release_version "\\.vsix$" { versioned = $0 }
       /\/vscode-pdf\.vsix$/ { preferred = $0 }
       first == "" { first = $0 }
       END {
-        if (preferred != "") {
+        if (versioned != "") {
+          print versioned
+        } else if (preferred != "") {
           print preferred
         } else {
           print first
@@ -48,6 +56,10 @@ if [ -z "$asset_url" ]; then
 fi
 
 vsix="${tmp_dir}/vscode-pdf.vsix"
+if [ -n "$release_tag" ]; then
+  echo "Latest release: ${release_tag}"
+fi
+
 echo "Downloading VS Code PDF Viewer from ${asset_url}..."
 curl -fL "$asset_url" -o "$vsix" || fail "Unable to download VSIX asset"
 
@@ -57,6 +69,18 @@ fi
 
 if command -v unzip >/dev/null 2>&1 && ! unzip -tq "$vsix" >/dev/null 2>&1; then
   fail "Downloaded VSIX is not a valid zip archive"
+fi
+
+if command -v unzip >/dev/null 2>&1; then
+  package_version="$(
+    unzip -p "$vsix" extension/package.json \
+      | sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | head -n 1
+  )"
+
+  if [ -n "$package_version" ]; then
+    echo "Extension package version: ${package_version}"
+  fi
 fi
 
 echo "Installing with ${code_cmd}..."

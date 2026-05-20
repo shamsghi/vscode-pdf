@@ -49,7 +49,7 @@
     "test:unit": "vitest run",
     "test:extension": "sfw pnpm compile && node ./out-test/test/runTest.js",
     "test": "sfw pnpm compile && sfw pnpm test:unit && sfw pnpm test:extension",
-    "package": "sfw pnpm compile && sfw pnpm exec vsce package --no-dependencies --allow-missing-repository"
+    "package": "rm -f vscode-pdf*.vsix && sfw pnpm compile && sfw pnpm exec vsce package --no-dependencies --allow-missing-repository && node -e \"const fs=require('fs'); const p=require('./package.json'); fs.copyFileSync('vscode-pdf-' + p.version + '.vsix', 'vscode-pdf.vsix')\""
   },
   "dependencies": {
     "pdfjs-dist": "^5.7.284"
