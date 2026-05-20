@@ -1,0 +1,11 @@
+node_modules/**
+src/**
+test/**
+scripts/**
+out-test/**
+.vscode-test/**
+.DS_Store
+*.tsbuildinfo
+vitest.config.*
+tsconfig*.json
+pnpm-lock.yaml

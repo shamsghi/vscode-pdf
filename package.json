@@ -1,0 +1,80 @@
+{
+  "name": "vscode-pdf",
+  "displayName": "VS Code PDF Viewer",
+  "description": "Secure read-only PDF viewer for VS Code custom editors using bundled pdf.js.",
+  "version": "0.0.1",
+  "publisher": "shamsghi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shamsghi/vscode-pdf.git"
+  },
+  "type": "commonjs",
+  "main": "./dist/extension.js",
+  "engines": {
+    "vscode": "^1.120.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCustomEditor:vscode-pdf.viewer"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "vscode-pdf.viewer",
+        "displayName": "PDF Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.pdf"
+          }
+        ],
+        "priority": "default"
+      }
+    ]
+  },
+  "scripts": {
+    "clean": "rm -rf dist media/vendor media/viewer out-test",
+    "copy:assets": "node ./scripts/copy-assets.mjs",
+    "compile:extension": "tsc -p tsconfig.json",
+    "compile:webview": "tsc -p tsconfig.webview.json",
+    "compile:tests": "tsc -p tsconfig.test.json",
+    "compile": "sfw pnpm copy:assets && sfw pnpm compile:extension && sfw pnpm compile:webview && sfw pnpm compile:tests",
+    "test:unit": "vitest run",
+    "test:extension": "sfw pnpm compile && node ./out-test/test/runTest.js",
+    "test": "sfw pnpm compile && sfw pnpm test:unit && sfw pnpm test:extension",
+    "package": "sfw pnpm compile && sfw pnpm exec vsce package --no-dependencies --allow-missing-repository"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^5.7.284"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^25.6.0",
+    "@types/vscode": "^1.118.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.1",
+    "mocha": "^11.7.5",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.1.1",
+      "onFail": "download"
+    }
+  },
+  "pnpm": {
+    "ignoredBuiltDependencies": [
+      "@vscode/vsce-sign",
+      "keytar"
+    ]
+  }
+}

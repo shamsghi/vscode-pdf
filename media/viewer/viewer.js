@@ -1,0 +1,740 @@
+"use strict";
+const vscode = acquireVsCodeApi();
+const app = requireElement("app");
+const pages = requireElement("pages");
+const statusElement = requireElement("status");
+const prevPage = requireElement("prevPage");
+const nextPage = requireElement("nextPage");
+const pageNumberInput = requireElement("pageNumber");
+const pageCount = requireElement("pageCount");
+const zoomOut = requireElement("zoomOut");
+const zoomIn = requireElement("zoomIn");
+const zoomLabel = requireElement("zoomLabel");
+const fitWidth = requireElement("fitWidth");
+const fitPage = requireElement("fitPage");
+const rotate = requireElement("rotate");
+const searchInput = requireElement("searchInput");
+const searchPrev = requireElement("searchPrev");
+const searchNext = requireElement("searchNext");
+const searchStatus = requireElement("searchStatus");
+const pdfModuleUri = app.dataset.pdfModuleUri;
+const pdfWorkerUri = app.dataset.pdfWorkerUri;
+let pdfjs;
+let pdfDocument;
+let currentPage = 1;
+let scale = 1;
+let rotation = 0;
+let fitMode = "width";
+let textCache = new Map();
+let matches = [];
+let activeMatch = -1;
+let pageShells = new Map();
+let renderedPages = new Set();
+let renderingPages = new Set();
+let pageObserver;
+let renderGeneration = 0;
+let isProgrammaticScroll = false;
+let selectionDrag;
+let selectedTextItems = [];
+const svgNamespace = "http://www.w3.org/2000/svg";
+const minLassoPointDistance = 2;
+void initialize();
+window.addEventListener("message", (event) => {
+    const message = event.data;
+    if (!isExtensionMessage(message)) {
+        return;
+    }
+    if (message.type === "loadError") {
+        showError(message.message);
+        return;
+    }
+    void loadPdf(message.dataBase64, message.fileName);
+});
+prevPage.addEventListener("click", () => goToPage(currentPage - 1));
+nextPage.addEventListener("click", () => goToPage(currentPage + 1));
+pageNumberInput.addEventListener("change", () => goToPage(Number(pageNumberInput.value)));
+zoomOut.addEventListener("click", () => setScale(scale / 1.2));
+zoomIn.addEventListener("click", () => setScale(scale * 1.2));
+fitWidth.addEventListener("click", () => setFitMode("width"));
+fitPage.addEventListener("click", () => setFitMode("page"));
+rotate.addEventListener("click", () => {
+    rotation = (rotation + 90) % 360;
+    void rerenderDocumentAtCurrentPage();
+});
+searchInput.addEventListener("input", () => void updateSearch(searchInput.value));
+searchPrev.addEventListener("click", () => moveMatch(-1));
+searchNext.addEventListener("click", () => moveMatch(1));
+pages.addEventListener("scroll", debounce(updateCurrentPageFromScroll, 80));
+pages.addEventListener("pointerdown", beginTextSelection);
+pages.addEventListener("pointermove", updateTextSelection);
+pages.addEventListener("pointerup", finishTextSelection);
+pages.addEventListener("pointercancel", finishTextSelection);
+document.addEventListener("copy", copySelectedText);
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+        clearTextSelection();
+    }
+});
+window.addEventListener("resize", debounce(() => {
+    if (fitMode !== "custom") {
+        void rerenderDocumentAtCurrentPage();
+    }
+}, 150));
+async function initialize() {
+    try {
+        if (!pdfModuleUri || !pdfWorkerUri) {
+            throw new Error("Viewer assets are unavailable.");
+        }
+        pdfjs = await import(pdfModuleUri);
+        const workerResponse = await fetch(pdfWorkerUri);
+        if (!workerResponse.ok) {
+            throw new Error("Unable to load PDF worker.");
+        }
+        const workerSource = await workerResponse.text();
+        pdfjs.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
+        setStatus("Waiting for PDF…");
+        vscode.postMessage({ type: "ready" });
+    }
+    catch (error) {
+        showError(errorMessage(error));
+    }
+}
+async function loadPdf(dataBase64, fileName) {
+    try {
+        if (!pdfjs) {
+            throw new Error("PDF renderer is not ready.");
+        }
+        setStatus(`Loading ${safeText(fileName, "PDF")}…`);
+        await pdfDocument?.destroy();
+        textCache = new Map();
+        matches = [];
+        activeMatch = -1;
+        pdfDocument = await pdfjs.getDocument({
+            data: base64ToBytes(dataBase64),
+            useSystemFonts: true
+        }).promise;
+        currentPage = 1;
+        updatePageControls();
+        await renderDocument();
+        setStatus("");
+    }
+    catch (error) {
+        showError(errorMessage(error));
+    }
+}
+async function renderDocument(scrollToCurrent = false) {
+    if (!pdfDocument) {
+        return;
+    }
+    const generation = ++renderGeneration;
+    pageObserver?.disconnect();
+    pageShells = new Map();
+    renderedPages = new Set();
+    renderingPages = new Set();
+    pages.replaceChildren();
+    setStatus("Preparing pages…");
+    pageObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (entry.isIntersecting) {
+                const pageNumber = Number(entry.target.dataset.pageNumber);
+                if (Number.isFinite(pageNumber)) {
+                    void renderPage(pageNumber, generation);
+                }
+            }
+        }
+    }, {
+        root: pages,
+        rootMargin: "900px 0px"
+    });
+    for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
+        const pageShell = document.createElement("article");
+        pageShell.className = "page pending";
+        pageShell.dataset.pageNumber = String(pageNumber);
+        pageShell.setAttribute("aria-label", `Page ${pageNumber}`);
+        const label = document.createElement("span");
+        label.className = "page-loading";
+        label.textContent = `Page ${pageNumber}`;
+        pageShell.append(label);
+        pages.append(pageShell);
+        pageShells.set(pageNumber, pageShell);
+        pageObserver.observe(pageShell);
+    }
+    setStatus("");
+    updatePageControls();
+    await renderPage(currentPage, generation);
+    if (scrollToCurrent) {
+        scrollToPage(currentPage);
+    }
+}
+async function renderPage(pageNumber, generation) {
+    if (!pdfDocument || !pdfjs || renderedPages.has(pageNumber) || renderingPages.has(pageNumber)) {
+        return;
+    }
+    const renderer = pdfjs;
+    renderingPages.add(pageNumber);
+    try {
+        const page = await pdfDocument.getPage(pageNumber);
+        if (generation !== renderGeneration) {
+            return;
+        }
+        const viewportAtOne = page.getViewport({ scale: 1, rotation });
+        const effectiveScale = calculateScale(viewportAtOne);
+        scale = effectiveScale;
+        const viewport = page.getViewport({ scale: effectiveScale, rotation });
+        const textContentPromise = page.getTextContent();
+        const pixelRatio = window.devicePixelRatio || 1;
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.floor(viewport.width * pixelRatio);
+        canvas.height = Math.floor(viewport.height * pixelRatio);
+        canvas.style.width = `${Math.floor(viewport.width)}px`;
+        canvas.style.height = `${Math.floor(viewport.height)}px`;
+        const context = canvas.getContext("2d");
+        if (!context) {
+            throw new Error("Unable to render PDF page.");
+        }
+        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+        await page.render({ canvasContext: context, viewport }).promise;
+        const textContent = await textContentPromise;
+        if (generation !== renderGeneration) {
+            return;
+        }
+        const pageShell = pageShells.get(pageNumber);
+        if (!pageShell) {
+            return;
+        }
+        pageShell.classList.remove("pending");
+        pageShell.style.width = `${Math.floor(viewport.width)}px`;
+        pageShell.style.minHeight = `${Math.floor(viewport.height)}px`;
+        const pageContent = document.createElement("div");
+        pageContent.className = "page-content";
+        pageContent.style.width = `${Math.floor(viewport.width)}px`;
+        pageContent.style.height = `${Math.floor(viewport.height)}px`;
+        pageContent.style.setProperty("--scale-factor", String(effectiveScale));
+        pageContent.style.setProperty("--user-unit", "1");
+        pageContent.style.setProperty("--total-scale-factor", String(effectiveScale));
+        pageContent.style.setProperty("--scale-round-x", "1px");
+        pageContent.style.setProperty("--scale-round-y", "1px");
+        const textLayerContainer = document.createElement("div");
+        textLayerContainer.className = "textLayer";
+        pageContent.append(canvas, textLayerContainer);
+        pageShell.replaceChildren();
+        pageShell.append(pageContent);
+        await new renderer.TextLayer({
+            textContentSource: textContent,
+            container: textLayerContainer,
+            viewport
+        }).render();
+        normalizeTextLayerSelectionOrder(textLayerContainer);
+        textLayerContainer.dataset.pageNumber = String(pageNumber);
+        renderedPages.add(pageNumber);
+        updatePageControls();
+    }
+    catch (error) {
+        showError(errorMessage(error));
+    }
+    finally {
+        renderingPages.delete(pageNumber);
+    }
+}
+function calculateScale(viewport) {
+    const chromePadding = 32;
+    if (fitMode === "width") {
+        return clamp((pages.clientWidth - chromePadding) / viewport.width, 0.2, 5);
+    }
+    if (fitMode === "page") {
+        const availableHeight = window.innerHeight - pages.getBoundingClientRect().top - chromePadding;
+        return clamp(Math.min((pages.clientWidth - chromePadding) / viewport.width, availableHeight / viewport.height), 0.2, 5);
+    }
+    return clamp(scale, 0.2, 5);
+}
+function setFitMode(mode) {
+    fitMode = mode;
+    void rerenderDocumentAtCurrentPage();
+}
+function setScale(nextScale) {
+    fitMode = "custom";
+    scale = clamp(nextScale, 0.2, 5);
+    void rerenderDocumentAtCurrentPage();
+}
+function goToPage(page) {
+    if (!pdfDocument || !Number.isFinite(page)) {
+        updatePageControls();
+        return;
+    }
+    currentPage = Math.trunc(clamp(page, 1, pdfDocument.numPages));
+    scrollToPage(currentPage);
+    void renderPage(currentPage, renderGeneration);
+    updatePageControls();
+}
+function scrollToPage(pageNumber) {
+    const pageShell = pageShells.get(pageNumber);
+    if (!pageShell) {
+        return;
+    }
+    isProgrammaticScroll = true;
+    pageShell.scrollIntoView({ block: "start" });
+    window.setTimeout(() => {
+        isProgrammaticScroll = false;
+        updateCurrentPageFromScroll();
+    }, 120);
+}
+function rerenderDocumentAtCurrentPage() {
+    void renderDocument(true);
+}
+function updateCurrentPageFromScroll() {
+    if (isProgrammaticScroll || pageShells.size === 0) {
+        return;
+    }
+    const pagesTop = pages.getBoundingClientRect().top;
+    let closestPage = currentPage;
+    let closestDistance = Number.POSITIVE_INFINITY;
+    for (const [pageNumber, pageShell] of pageShells) {
+        const distance = Math.abs(pageShell.getBoundingClientRect().top - pagesTop - 12);
+        if (distance < closestDistance) {
+            closestDistance = distance;
+            closestPage = pageNumber;
+        }
+    }
+    if (closestPage !== currentPage) {
+        currentPage = closestPage;
+        updatePageControls();
+    }
+}
+function normalizeTextLayerSelectionOrder(container) {
+    const textSpans = Array.from(container.querySelectorAll("span[role='presentation']"));
+    if (textSpans.length < 2) {
+        return;
+    }
+    const containerRect = container.getBoundingClientRect();
+    const orderedSpans = textSpans
+        .map((span, originalIndex) => {
+        const rect = span.getBoundingClientRect();
+        return {
+            span,
+            originalIndex,
+            top: rect.top - containerRect.top,
+            left: rect.left - containerRect.left,
+            height: rect.height
+        };
+    })
+        .sort((a, b) => {
+        const lineTolerance = Math.max(3, Math.min(a.height || 0, b.height || 0) * 0.45);
+        if (Math.abs(a.top - b.top) > lineTolerance) {
+            return a.top - b.top;
+        }
+        if (Math.abs(a.left - b.left) > 1) {
+            return a.left - b.left;
+        }
+        return a.originalIndex - b.originalIndex;
+    });
+    const fragment = document.createDocumentFragment();
+    let previousTop;
+    for (const item of orderedSpans) {
+        if (previousTop !== undefined && Math.abs(item.top - previousTop) > Math.max(4, item.height * 0.6)) {
+            const lineBreak = document.createElement("br");
+            lineBreak.setAttribute("role", "presentation");
+            fragment.append(lineBreak);
+        }
+        fragment.append(item.span);
+        previousTop = item.top;
+    }
+    const endOfContent = container.querySelector(".endOfContent");
+    container.replaceChildren(fragment);
+    if (endOfContent) {
+        container.append(endOfContent);
+    }
+}
+function beginTextSelection(event) {
+    if (event.button !== 0) {
+        return;
+    }
+    const target = event.target;
+    if (!(target instanceof Element)) {
+        return;
+    }
+    const textLayer = target.closest(".textLayer");
+    const pageContent = target.closest(".page-content");
+    if (!textLayer || !pageContent) {
+        clearTextSelection();
+        return;
+    }
+    event.preventDefault();
+    pages.setPointerCapture(event.pointerId);
+    clearTextSelection();
+    const contentRect = pageContent.getBoundingClientRect();
+    const overlay = document.createElementNS(svgNamespace, "svg");
+    overlay.classList.add("selection-lasso");
+    overlay.setAttribute("width", `${contentRect.width}`);
+    overlay.setAttribute("height", `${contentRect.height}`);
+    overlay.setAttribute("viewBox", `0 0 ${contentRect.width} ${contentRect.height}`);
+    const outline = document.createElementNS(svgNamespace, "polyline");
+    outline.classList.add("selection-lasso-outline");
+    overlay.append(outline);
+    pageContent.append(overlay);
+    selectionDrag = {
+        pageContent,
+        textLayer,
+        overlay,
+        outline,
+        points: [eventToSelectionPoint(event, contentRect)],
+        pageNumber: Number(textLayer.dataset.pageNumber) || 0
+    };
+    updateTextSelection(event);
+}
+function updateTextSelection(event) {
+    if (!selectionDrag) {
+        return;
+    }
+    event.preventDefault();
+    const contentRect = selectionDrag.pageContent.getBoundingClientRect();
+    const point = eventToSelectionPoint(event, contentRect);
+    const previousPoint = selectionDrag.points.at(-1);
+    if (!previousPoint || pointDistance(previousPoint, point) >= minLassoPointDistance) {
+        selectionDrag.points.push(point);
+    }
+    renderSelectionLasso(selectionDrag);
+    applyLassoTextSelection(selectionDrag.textLayer, selectionDrag.points);
+}
+function finishTextSelection(event) {
+    if (!selectionDrag) {
+        return;
+    }
+    event.preventDefault();
+    selectionDrag.overlay.remove();
+    selectionDrag = undefined;
+}
+function eventToSelectionPoint(event, contentRect) {
+    return {
+        x: clamp(event.clientX - contentRect.left, 0, contentRect.width),
+        y: clamp(event.clientY - contentRect.top, 0, contentRect.height)
+    };
+}
+function pointDistance(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+}
+function renderSelectionLasso(drag) {
+    const points = getClosedLassoPoints(drag.points);
+    drag.outline.setAttribute("points", points.map((point) => `${point.x},${point.y}`).join(" "));
+}
+function getClosedLassoPoints(points) {
+    if (points.length < 3) {
+        return points;
+    }
+    return [...points, points[0]];
+}
+function applyLassoTextSelection(textLayer, points) {
+    const layerRect = textLayer.getBoundingClientRect();
+    textLayer.querySelectorAll(".custom-selection-highlight").forEach((element) => element.remove());
+    selectedTextItems = [];
+    if (points.length < 3) {
+        return;
+    }
+    for (const span of Array.from(textLayer.querySelectorAll("span[role='presentation']"))) {
+        for (const item of getSelectableWordItems(span, layerRect)) {
+            if (lassoIntersectsRect(points, {
+                left: item.left,
+                top: item.top,
+                right: item.right,
+                bottom: item.top + item.height
+            })) {
+                selectedTextItems.push(item);
+                drawSelectionHighlight(textLayer, item);
+            }
+        }
+    }
+    selectedTextItems.sort(compareTextItemsVisually);
+}
+function getSelectableWordItems(span, layerRect) {
+    const text = span.textContent ?? "";
+    if (!text.trim() || !span.firstChild) {
+        return [];
+    }
+    const items = [];
+    const matcher = /\S+/g;
+    for (const match of text.matchAll(matcher)) {
+        const word = match[0];
+        const start = match.index ?? 0;
+        const end = start + word.length;
+        const rect = measureTextNodeRange(span.firstChild, start, end) ?? estimateWordRect(span, text, start, end);
+        if (!rect || rect.width <= 0 || rect.height <= 0) {
+            continue;
+        }
+        items.push({
+            text: word,
+            top: rect.top - layerRect.top,
+            left: rect.left - layerRect.left,
+            right: rect.right - layerRect.left,
+            height: rect.height
+        });
+    }
+    return items;
+}
+function measureTextNodeRange(node, start, end) {
+    if (node.nodeType !== Node.TEXT_NODE) {
+        return undefined;
+    }
+    const range = document.createRange();
+    try {
+        range.setStart(node, start);
+        range.setEnd(node, end);
+        const rect = range.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 ? rect : undefined;
+    }
+    finally {
+        range.detach();
+    }
+}
+function estimateWordRect(span, text, start, end) {
+    const rect = span.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0 || text.length === 0) {
+        return undefined;
+    }
+    const left = rect.left + rect.width * (start / text.length);
+    const right = rect.left + rect.width * (end / text.length);
+    return new DOMRect(left, rect.top, right - left, rect.height);
+}
+function drawSelectionHighlight(textLayer, item) {
+    const highlight = document.createElement("div");
+    highlight.className = "custom-selection-highlight";
+    highlight.style.left = `${item.left}px`;
+    highlight.style.top = `${item.top}px`;
+    highlight.style.width = `${Math.max(1, item.right - item.left)}px`;
+    highlight.style.height = `${Math.max(1, item.height)}px`;
+    textLayer.append(highlight);
+}
+function copySelectedText(event) {
+    if (selectedTextItems.length === 0 || !event.clipboardData) {
+        return;
+    }
+    event.preventDefault();
+    event.clipboardData.setData("text/plain", selectedItemsToText(selectedTextItems));
+}
+function selectedItemsToText(items) {
+    const lines = [];
+    for (const item of items) {
+        const lastLine = lines.at(-1);
+        const tolerance = Math.max(4, item.height * 0.7);
+        if (!lastLine || Math.abs(lastLine[0].top - item.top) > tolerance) {
+            lines.push([item]);
+        }
+        else {
+            lastLine.push(item);
+        }
+    }
+    return lines
+        .map((line) => line
+        .sort((a, b) => a.left - b.left)
+        .map((item) => item.text)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim())
+        .filter(Boolean)
+        .join("\n");
+}
+function clearTextSelection() {
+    selectionDrag?.overlay.remove();
+    selectionDrag = undefined;
+    pages.querySelectorAll(".custom-selection-highlight").forEach((element) => element.remove());
+    selectedTextItems = [];
+    window.getSelection()?.removeAllRanges();
+}
+function lassoIntersectsRect(points, rect) {
+    const center = {
+        x: rect.left + (rect.right - rect.left) / 2,
+        y: rect.top + (rect.bottom - rect.top) / 2
+    };
+    if (pointInPolygon(center, points)) {
+        return true;
+    }
+    const rectCorners = [
+        { x: rect.left, y: rect.top },
+        { x: rect.right, y: rect.top },
+        { x: rect.right, y: rect.bottom },
+        { x: rect.left, y: rect.bottom }
+    ];
+    if (rectCorners.some((corner) => pointInPolygon(corner, points))) {
+        return true;
+    }
+    return polygonIntersectsRect(points, rectCorners);
+}
+function pointInPolygon(point, polygon) {
+    let inside = false;
+    for (let index = 0, previousIndex = polygon.length - 1; index < polygon.length; previousIndex = index, index += 1) {
+        const current = polygon[index];
+        const previous = polygon[previousIndex];
+        const crossesY = current.y > point.y !== previous.y > point.y;
+        if (!crossesY) {
+            continue;
+        }
+        const crossingX = ((previous.x - current.x) * (point.y - current.y)) / (previous.y - current.y) + current.x;
+        if (point.x < crossingX) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+function polygonIntersectsRect(polygon, rectCorners) {
+    const rectEdges = [
+        [rectCorners[0], rectCorners[1]],
+        [rectCorners[1], rectCorners[2]],
+        [rectCorners[2], rectCorners[3]],
+        [rectCorners[3], rectCorners[0]]
+    ];
+    for (let index = 0; index < polygon.length; index += 1) {
+        const nextIndex = (index + 1) % polygon.length;
+        const polygonEdge = [polygon[index], polygon[nextIndex]];
+        if (rectEdges.some((rectEdge) => segmentsIntersect(polygonEdge[0], polygonEdge[1], rectEdge[0], rectEdge[1]))) {
+            return true;
+        }
+    }
+    return false;
+}
+function segmentsIntersect(a, b, c, d) {
+    const directionA = segmentDirection(a, b, c);
+    const directionB = segmentDirection(a, b, d);
+    const directionC = segmentDirection(c, d, a);
+    const directionD = segmentDirection(c, d, b);
+    if (directionA === 0 && pointOnSegment(c, a, b)) {
+        return true;
+    }
+    if (directionB === 0 && pointOnSegment(d, a, b)) {
+        return true;
+    }
+    if (directionC === 0 && pointOnSegment(a, c, d)) {
+        return true;
+    }
+    if (directionD === 0 && pointOnSegment(b, c, d)) {
+        return true;
+    }
+    return directionA > 0 !== directionB > 0 && directionC > 0 !== directionD > 0;
+}
+function segmentDirection(a, b, c) {
+    return (c.x - a.x) * (b.y - a.y) - (b.x - a.x) * (c.y - a.y);
+}
+function pointOnSegment(point, start, end) {
+    return point.x >= Math.min(start.x, end.x)
+        && point.x <= Math.max(start.x, end.x)
+        && point.y >= Math.min(start.y, end.y)
+        && point.y <= Math.max(start.y, end.y);
+}
+function compareTextItemsVisually(a, b) {
+    const lineTolerance = Math.max(4, Math.min(a.height || 0, b.height || 0) * 0.7);
+    if (Math.abs(a.top - b.top) > lineTolerance) {
+        return a.top - b.top;
+    }
+    if (Math.abs(a.left - b.left) > 1) {
+        return a.left - b.left;
+    }
+    return 0;
+}
+async function updateSearch(rawQuery) {
+    const query = safeText(rawQuery).trim().toLocaleLowerCase();
+    matches = [];
+    activeMatch = -1;
+    if (!pdfDocument || !query) {
+        searchStatus.textContent = "";
+        return;
+    }
+    setSearchStatus("Searching…");
+    for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
+        const text = await getPageText(pageNumber);
+        let index = text.indexOf(query);
+        while (index !== -1) {
+            matches.push({ page: pageNumber, index });
+            index = text.indexOf(query, index + query.length);
+        }
+    }
+    if (matches.length === 0) {
+        setSearchStatus("No matches");
+        return;
+    }
+    activeMatch = 0;
+    setSearchStatus(`1 of ${matches.length}`);
+    goToPage(matches[0].page);
+}
+async function getPageText(pageNumber) {
+    const cached = textCache.get(pageNumber);
+    if (cached !== undefined) {
+        return cached;
+    }
+    if (!pdfDocument) {
+        return "";
+    }
+    const page = await pdfDocument.getPage(pageNumber);
+    const content = await page.getTextContent();
+    const text = content.items.map((item) => item.str ?? "").join(" ").toLocaleLowerCase();
+    textCache.set(pageNumber, text);
+    return text;
+}
+function moveMatch(delta) {
+    if (matches.length === 0) {
+        return;
+    }
+    activeMatch = (activeMatch + delta + matches.length) % matches.length;
+    setSearchStatus(`${activeMatch + 1} of ${matches.length}`);
+    goToPage(matches[activeMatch].page);
+}
+function updatePageControls() {
+    const total = pdfDocument?.numPages ?? 0;
+    pageNumberInput.max = String(Math.max(total, 1));
+    pageNumberInput.value = String(currentPage);
+    pageCount.textContent = `/ ${total || "-"}`;
+    zoomLabel.textContent = `${Math.round(scale * 100)}%`;
+    prevPage.disabled = !pdfDocument || currentPage <= 1;
+    nextPage.disabled = !pdfDocument || currentPage >= total;
+}
+function setStatus(message) {
+    statusElement.textContent = message;
+    statusElement.hidden = message.length === 0;
+}
+function setSearchStatus(message) {
+    searchStatus.textContent = message;
+}
+function showError(message) {
+    setStatus(message);
+    statusElement.classList.add("error");
+    vscode.postMessage({ type: "viewerError", message });
+}
+function base64ToBytes(value) {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+}
+function isExtensionMessage(value) {
+    if (!value || typeof value !== "object") {
+        return false;
+    }
+    const candidate = value;
+    if (candidate.type === "loadPdf") {
+        return typeof candidate.requestId === "number" && typeof candidate.fileName === "string" && typeof candidate.dataBase64 === "string";
+    }
+    return candidate.type === "loadError" && typeof candidate.requestId === "number" && typeof candidate.fileName === "string" && typeof candidate.message === "string";
+}
+function requireElement(id) {
+    const element = document.getElementById(id);
+    if (!element) {
+        throw new Error(`Missing element: ${id}`);
+    }
+    return element;
+}
+function safeText(value, fallback = "") {
+    return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 1000) : fallback;
+}
+function errorMessage(error) {
+    const raw = error instanceof Error ? error.message : String(error);
+    return safeText(raw, "Unable to display PDF.");
+}
+function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
+function debounce(callback, delayMs) {
+    let handle = 0;
+    return () => {
+        window.clearTimeout(handle);
+        handle = window.setTimeout(callback, delayMs);
+    };
+}
+//# sourceMappingURL=viewer.js.map
