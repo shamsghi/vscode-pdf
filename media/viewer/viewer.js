@@ -13,12 +13,17 @@ const zoomLabel = requireElement("zoomLabel");
 const fitWidth = requireElement("fitWidth");
 const fitPage = requireElement("fitPage");
 const rotate = requireElement("rotate");
+const selectFreestyle = requireElement("selectFreestyle");
+const selectRectangle = requireElement("selectRectangle");
 const searchInput = requireElement("searchInput");
 const searchPrev = requireElement("searchPrev");
 const searchNext = requireElement("searchNext");
 const searchStatus = requireElement("searchStatus");
 const pdfModuleUri = app.dataset.pdfModuleUri;
 const pdfWorkerUri = app.dataset.pdfWorkerUri;
+const svgNamespace = "http://www.w3.org/2000/svg";
+const minLassoPointDistance = 2;
+const selectionModeStorageKey = "vscode-pdf.selectionMode";
 let pdfjs;
 let pdfDocument;
 let currentPage = 1;
@@ -26,6 +31,8 @@ let scale = 1;
 let rotation = 0;
 let fitMode = "width";
 let textCache = new Map();
+let searchQuery = "";
+let searchGeneration = 0;
 let matches = [];
 let activeMatch = -1;
 let pageShells = new Map();
@@ -34,10 +41,9 @@ let renderingPages = new Set();
 let pageObserver;
 let renderGeneration = 0;
 let isProgrammaticScroll = false;
+let selectionMode = getInitialTextSelectionMode();
 let selectionDrag;
 let selectedTextItems = [];
-const svgNamespace = "http://www.w3.org/2000/svg";
-const minLassoPointDistance = 2;
 void initialize();
 window.addEventListener("message", (event) => {
     const message = event.data;
@@ -61,6 +67,8 @@ rotate.addEventListener("click", () => {
     rotation = (rotation + 90) % 360;
     void rerenderDocumentAtCurrentPage();
 });
+selectFreestyle.addEventListener("click", () => setTextSelectionMode("freestyle"));
+selectRectangle.addEventListener("click", () => setTextSelectionMode("rectangle"));
 searchInput.addEventListener("input", () => void updateSearch(searchInput.value));
 searchPrev.addEventListener("click", () => moveMatch(-1));
 searchNext.addEventListener("click", () => moveMatch(1));
@@ -80,6 +88,7 @@ window.addEventListener("resize", debounce(() => {
         void rerenderDocumentAtCurrentPage();
     }
 }, 150));
+updateTextSelectionModeControls();
 async function initialize() {
     try {
         if (!pdfModuleUri || !pdfWorkerUri) {
@@ -107,6 +116,8 @@ async function loadPdf(dataBase64, fileName) {
         setStatus(`Loading ${safeText(fileName, "PDF")}…`);
         await pdfDocument?.destroy();
         textCache = new Map();
+        searchQuery = "";
+        searchGeneration += 1;
         matches = [];
         activeMatch = -1;
         pdfDocument = await pdfjs.getDocument({
@@ -226,6 +237,7 @@ async function renderPage(pageNumber, generation) {
         }).render();
         normalizeTextLayerSelectionOrder(textLayerContainer);
         textLayerContainer.dataset.pageNumber = String(pageNumber);
+        drawSearchHighlights(textLayerContainer, pageNumber);
         renderedPages.add(pageNumber);
         updatePageControls();
     }
@@ -344,6 +356,28 @@ function normalizeTextLayerSelectionOrder(container) {
         container.append(endOfContent);
     }
 }
+function getInitialTextSelectionMode() {
+    const vscodeStateMode = vscode.getState()?.selectionMode;
+    if (isTextSelectionMode(vscodeStateMode)) {
+        return vscodeStateMode;
+    }
+    const storedMode = window.localStorage.getItem(selectionModeStorageKey);
+    return isTextSelectionMode(storedMode) ? storedMode : "freestyle";
+}
+function setTextSelectionMode(mode) {
+    selectionMode = mode;
+    vscode.setState({ selectionMode });
+    window.localStorage.setItem(selectionModeStorageKey, selectionMode);
+    updateTextSelectionModeControls();
+    clearTextSelection();
+}
+function updateTextSelectionModeControls() {
+    selectFreestyle.setAttribute("aria-pressed", String(selectionMode === "freestyle"));
+    selectRectangle.setAttribute("aria-pressed", String(selectionMode === "rectangle"));
+}
+function isTextSelectionMode(value) {
+    return value === "freestyle" || value === "rectangle";
+}
 function beginTextSelection(event) {
     if (event.button !== 0) {
         return;
@@ -364,6 +398,7 @@ function beginTextSelection(event) {
     const contentRect = pageContent.getBoundingClientRect();
     const overlay = document.createElementNS(svgNamespace, "svg");
     overlay.classList.add("selection-lasso");
+    overlay.classList.add(`selection-${selectionMode}`);
     overlay.setAttribute("width", `${contentRect.width}`);
     overlay.setAttribute("height", `${contentRect.height}`);
     overlay.setAttribute("viewBox", `0 0 ${contentRect.width} ${contentRect.height}`);
@@ -376,6 +411,7 @@ function beginTextSelection(event) {
         textLayer,
         overlay,
         outline,
+        mode: selectionMode,
         points: [eventToSelectionPoint(event, contentRect)],
         pageNumber: Number(textLayer.dataset.pageNumber) || 0
     };
@@ -388,12 +424,17 @@ function updateTextSelection(event) {
     event.preventDefault();
     const contentRect = selectionDrag.pageContent.getBoundingClientRect();
     const point = eventToSelectionPoint(event, contentRect);
-    const previousPoint = selectionDrag.points.at(-1);
-    if (!previousPoint || pointDistance(previousPoint, point) >= minLassoPointDistance) {
-        selectionDrag.points.push(point);
+    if (selectionDrag.mode === "rectangle") {
+        selectionDrag.points[1] = point;
     }
-    renderSelectionLasso(selectionDrag);
-    applyLassoTextSelection(selectionDrag.textLayer, selectionDrag.points);
+    else {
+        const previousPoint = selectionDrag.points.at(-1);
+        if (!previousPoint || pointDistance(previousPoint, point) >= minLassoPointDistance) {
+            selectionDrag.points.push(point);
+        }
+    }
+    renderSelectionOutline(selectionDrag);
+    applyTextSelection(selectionDrag.textLayer, getSelectionPolygon(selectionDrag));
 }
 function finishTextSelection(event) {
     if (!selectionDrag) {
@@ -412,17 +453,28 @@ function eventToSelectionPoint(event, contentRect) {
 function pointDistance(a, b) {
     return Math.hypot(a.x - b.x, a.y - b.y);
 }
-function renderSelectionLasso(drag) {
-    const points = getClosedLassoPoints(drag.points);
+function renderSelectionOutline(drag) {
+    const points = getSelectionPolygon(drag);
     drag.outline.setAttribute("points", points.map((point) => `${point.x},${point.y}`).join(" "));
 }
-function getClosedLassoPoints(points) {
-    if (points.length < 3) {
-        return points;
+function getSelectionPolygon(drag) {
+    if (drag.mode === "rectangle") {
+        const start = drag.points[0];
+        const end = drag.points[1] ?? start;
+        return [
+            start,
+            { x: end.x, y: start.y },
+            end,
+            { x: start.x, y: end.y },
+            start
+        ];
     }
-    return [...points, points[0]];
+    if (drag.points.length < 3) {
+        return drag.points;
+    }
+    return [...drag.points, drag.points[0]];
 }
-function applyLassoTextSelection(textLayer, points) {
+function applyTextSelection(textLayer, points) {
     const layerRect = textLayer.getBoundingClientRect();
     textLayer.querySelectorAll(".custom-selection-highlight").forEach((element) => element.remove());
     selectedTextItems = [];
@@ -629,8 +681,11 @@ function compareTextItemsVisually(a, b) {
 }
 async function updateSearch(rawQuery) {
     const query = safeText(rawQuery).trim().toLocaleLowerCase();
+    const generation = ++searchGeneration;
+    searchQuery = query;
     matches = [];
     activeMatch = -1;
+    clearSearchHighlights();
     if (!pdfDocument || !query) {
         searchStatus.textContent = "";
         return;
@@ -638,9 +693,14 @@ async function updateSearch(rawQuery) {
     setSearchStatus("Searching…");
     for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
         const text = await getPageText(pageNumber);
+        if (generation !== searchGeneration) {
+            return;
+        }
+        let pageMatchIndex = 0;
         let index = text.indexOf(query);
         while (index !== -1) {
-            matches.push({ page: pageNumber, index });
+            matches.push({ page: pageNumber, index, pageMatchIndex });
+            pageMatchIndex += 1;
             index = text.indexOf(query, index + query.length);
         }
     }
@@ -650,6 +710,7 @@ async function updateSearch(rawQuery) {
     }
     activeMatch = 0;
     setSearchStatus(`1 of ${matches.length}`);
+    refreshSearchHighlights();
     goToPage(matches[0].page);
 }
 async function getPageText(pageNumber) {
@@ -672,7 +733,71 @@ function moveMatch(delta) {
     }
     activeMatch = (activeMatch + delta + matches.length) % matches.length;
     setSearchStatus(`${activeMatch + 1} of ${matches.length}`);
+    refreshSearchHighlights();
     goToPage(matches[activeMatch].page);
+}
+function refreshSearchHighlights() {
+    for (const textLayer of pages.querySelectorAll(".textLayer")) {
+        const pageNumber = Number(textLayer.dataset.pageNumber);
+        if (Number.isFinite(pageNumber)) {
+            drawSearchHighlights(textLayer, pageNumber);
+        }
+    }
+}
+function clearSearchHighlights() {
+    pages.querySelectorAll(".search-highlight").forEach((element) => element.remove());
+}
+function drawSearchHighlights(textLayer, pageNumber) {
+    textLayer.querySelectorAll(".search-highlight").forEach((element) => element.remove());
+    if (!searchQuery) {
+        return;
+    }
+    const active = activeMatch >= 0 ? matches[activeMatch] : undefined;
+    const layerRect = textLayer.getBoundingClientRect();
+    const searchable = getSearchableTextFromLayer(textLayer);
+    let pageMatchIndex = 0;
+    let index = searchable.text.toLocaleLowerCase().indexOf(searchQuery);
+    while (index !== -1) {
+        const isActive = active?.page === pageNumber && active.pageMatchIndex === pageMatchIndex;
+        drawSearchMatch(textLayer, layerRect, searchable.segments, index, index + searchQuery.length, isActive);
+        pageMatchIndex += 1;
+        index = searchable.text.toLocaleLowerCase().indexOf(searchQuery, index + searchQuery.length);
+    }
+}
+function getSearchableTextFromLayer(textLayer) {
+    let text = "";
+    const segments = [];
+    for (const span of textLayer.querySelectorAll("span[role='presentation']")) {
+        const spanText = span.textContent ?? "";
+        if (!spanText) {
+            continue;
+        }
+        const start = text.length;
+        text += spanText;
+        segments.push({ span, start, end: text.length });
+        text += " ";
+    }
+    return { text, segments };
+}
+function drawSearchMatch(textLayer, layerRect, segments, start, end, isActive) {
+    for (const segment of segments) {
+        const overlapStart = Math.max(start, segment.start);
+        const overlapEnd = Math.min(end, segment.end);
+        if (overlapStart >= overlapEnd || !segment.span.firstChild) {
+            continue;
+        }
+        const rect = measureTextNodeRange(segment.span.firstChild, overlapStart - segment.start, overlapEnd - segment.start) ?? estimateWordRect(segment.span, segment.span.textContent ?? "", overlapStart - segment.start, overlapEnd - segment.start);
+        if (!rect || rect.width <= 0 || rect.height <= 0) {
+            continue;
+        }
+        const highlight = document.createElement("div");
+        highlight.className = isActive ? "search-highlight active" : "search-highlight";
+        highlight.style.left = `${rect.left - layerRect.left}px`;
+        highlight.style.top = `${rect.top - layerRect.top}px`;
+        highlight.style.width = `${Math.max(1, rect.width)}px`;
+        highlight.style.height = `${Math.max(1, rect.height)}px`;
+        textLayer.append(highlight);
+    }
 }
 function updatePageControls() {
     const total = pdfDocument?.numPages ?? 0;

@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { buildWebviewHtml } from "../../src/extension/webview/html";
+import { isWebviewToExtensionMessage } from "../../src/extension/webview/messages";
 import {
   buildContentSecurityPolicy,
-  buildWebviewHtml,
-  isWebviewToExtensionMessage,
   sanitizeUiText
-} from "../../src/security";
+} from "../../src/extension/webview/security";
 
 describe("webview security helpers", () => {
   it("builds a strict CSP for bundled viewer assets only", () => {

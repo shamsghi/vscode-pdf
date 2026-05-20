@@ -1,4 +1,8 @@
-declare function acquireVsCodeApi(): { postMessage(message: unknown): void };
+declare function acquireVsCodeApi(): {
+  postMessage(message: unknown): void;
+  getState(): ViewerState | undefined;
+  setState(state: ViewerState): void;
+};
 
 type PdfJsModule = {
   GlobalWorkerOptions: { workerSrc: string };
@@ -49,13 +53,32 @@ type SelectionPoint = {
   y: number;
 };
 
+type TextSelectionMode = "freestyle" | "rectangle";
+
 type SelectionDrag = {
   pageContent: HTMLElement;
   textLayer: HTMLElement;
   overlay: SVGSVGElement;
   outline: SVGPolylineElement;
+  mode: TextSelectionMode;
   points: SelectionPoint[];
   pageNumber: number;
+};
+
+type SearchMatch = {
+  page: number;
+  index: number;
+  pageMatchIndex: number;
+};
+
+type SearchTextSegment = {
+  span: HTMLElement;
+  start: number;
+  end: number;
+};
+
+type ViewerState = {
+  selectionMode?: TextSelectionMode;
 };
 
 const vscode = acquireVsCodeApi();
@@ -72,6 +95,8 @@ const zoomLabel = requireElement<HTMLElement>("zoomLabel");
 const fitWidth = requireElement<HTMLButtonElement>("fitWidth");
 const fitPage = requireElement<HTMLButtonElement>("fitPage");
 const rotate = requireElement<HTMLButtonElement>("rotate");
+const selectFreestyle = requireElement<HTMLButtonElement>("selectFreestyle");
+const selectRectangle = requireElement<HTMLButtonElement>("selectRectangle");
 const searchInput = requireElement<HTMLInputElement>("searchInput");
 const searchPrev = requireElement<HTMLButtonElement>("searchPrev");
 const searchNext = requireElement<HTMLButtonElement>("searchNext");
@@ -79,6 +104,9 @@ const searchStatus = requireElement<HTMLElement>("searchStatus");
 
 const pdfModuleUri = app.dataset.pdfModuleUri;
 const pdfWorkerUri = app.dataset.pdfWorkerUri;
+const svgNamespace = "http://www.w3.org/2000/svg";
+const minLassoPointDistance = 2;
+const selectionModeStorageKey = "vscode-pdf.selectionMode";
 
 let pdfjs: PdfJsModule | undefined;
 let pdfDocument: PdfDocumentProxy | undefined;
@@ -87,7 +115,9 @@ let scale = 1;
 let rotation = 0;
 let fitMode: "custom" | "width" | "page" = "width";
 let textCache = new Map<number, string>();
-let matches: Array<{ page: number; index: number }> = [];
+let searchQuery = "";
+let searchGeneration = 0;
+let matches: SearchMatch[] = [];
 let activeMatch = -1;
 let pageShells = new Map<number, HTMLElement>();
 let renderedPages = new Set<number>();
@@ -95,11 +125,9 @@ let renderingPages = new Set<number>();
 let pageObserver: IntersectionObserver | undefined;
 let renderGeneration = 0;
 let isProgrammaticScroll = false;
+let selectionMode: TextSelectionMode = getInitialTextSelectionMode();
 let selectionDrag: SelectionDrag | undefined;
 let selectedTextItems: TextSelectionItem[] = [];
-
-const svgNamespace = "http://www.w3.org/2000/svg";
-const minLassoPointDistance = 2;
 
 void initialize();
 
@@ -128,6 +156,8 @@ rotate.addEventListener("click", () => {
   rotation = (rotation + 90) % 360;
   void rerenderDocumentAtCurrentPage();
 });
+selectFreestyle.addEventListener("click", () => setTextSelectionMode("freestyle"));
+selectRectangle.addEventListener("click", () => setTextSelectionMode("rectangle"));
 searchInput.addEventListener("input", () => void updateSearch(searchInput.value));
 searchPrev.addEventListener("click", () => moveMatch(-1));
 searchNext.addEventListener("click", () => moveMatch(1));
@@ -147,6 +177,8 @@ window.addEventListener("resize", debounce(() => {
     void rerenderDocumentAtCurrentPage();
   }
 }, 150));
+
+updateTextSelectionModeControls();
 
 async function initialize(): Promise<void> {
   try {
@@ -177,6 +209,8 @@ async function loadPdf(dataBase64: string, fileName: string): Promise<void> {
     setStatus(`Loading ${safeText(fileName, "PDF")}…`);
     await pdfDocument?.destroy();
     textCache = new Map();
+    searchQuery = "";
+    searchGeneration += 1;
     matches = [];
     activeMatch = -1;
     pdfDocument = await pdfjs.getDocument({
@@ -303,6 +337,7 @@ async function renderPage(pageNumber: number, generation: number): Promise<void>
     }).render();
     normalizeTextLayerSelectionOrder(textLayerContainer);
     textLayerContainer.dataset.pageNumber = String(pageNumber);
+    drawSearchHighlights(textLayerContainer, pageNumber);
     renderedPages.add(pageNumber);
     updatePageControls();
   } catch (error) {
@@ -433,6 +468,33 @@ function normalizeTextLayerSelectionOrder(container: HTMLElement): void {
   }
 }
 
+function getInitialTextSelectionMode(): TextSelectionMode {
+  const vscodeStateMode = vscode.getState()?.selectionMode;
+  if (isTextSelectionMode(vscodeStateMode)) {
+    return vscodeStateMode;
+  }
+
+  const storedMode = window.localStorage.getItem(selectionModeStorageKey);
+  return isTextSelectionMode(storedMode) ? storedMode : "freestyle";
+}
+
+function setTextSelectionMode(mode: TextSelectionMode): void {
+  selectionMode = mode;
+  vscode.setState({ selectionMode });
+  window.localStorage.setItem(selectionModeStorageKey, selectionMode);
+  updateTextSelectionModeControls();
+  clearTextSelection();
+}
+
+function updateTextSelectionModeControls(): void {
+  selectFreestyle.setAttribute("aria-pressed", String(selectionMode === "freestyle"));
+  selectRectangle.setAttribute("aria-pressed", String(selectionMode === "rectangle"));
+}
+
+function isTextSelectionMode(value: unknown): value is TextSelectionMode {
+  return value === "freestyle" || value === "rectangle";
+}
+
 function beginTextSelection(event: PointerEvent): void {
   if (event.button !== 0) {
     return;
@@ -457,6 +519,7 @@ function beginTextSelection(event: PointerEvent): void {
   const contentRect = pageContent.getBoundingClientRect();
   const overlay = document.createElementNS(svgNamespace, "svg");
   overlay.classList.add("selection-lasso");
+  overlay.classList.add(`selection-${selectionMode}`);
   overlay.setAttribute("width", `${contentRect.width}`);
   overlay.setAttribute("height", `${contentRect.height}`);
   overlay.setAttribute("viewBox", `0 0 ${contentRect.width} ${contentRect.height}`);
@@ -470,6 +533,7 @@ function beginTextSelection(event: PointerEvent): void {
     textLayer,
     overlay,
     outline,
+    mode: selectionMode,
     points: [eventToSelectionPoint(event, contentRect)],
     pageNumber: Number(textLayer.dataset.pageNumber) || 0
   };
@@ -485,13 +549,17 @@ function updateTextSelection(event: PointerEvent): void {
   event.preventDefault();
   const contentRect = selectionDrag.pageContent.getBoundingClientRect();
   const point = eventToSelectionPoint(event, contentRect);
-  const previousPoint = selectionDrag.points.at(-1);
-  if (!previousPoint || pointDistance(previousPoint, point) >= minLassoPointDistance) {
-    selectionDrag.points.push(point);
+  if (selectionDrag.mode === "rectangle") {
+    selectionDrag.points[1] = point;
+  } else {
+    const previousPoint = selectionDrag.points.at(-1);
+    if (!previousPoint || pointDistance(previousPoint, point) >= minLassoPointDistance) {
+      selectionDrag.points.push(point);
+    }
   }
 
-  renderSelectionLasso(selectionDrag);
-  applyLassoTextSelection(selectionDrag.textLayer, selectionDrag.points);
+  renderSelectionOutline(selectionDrag);
+  applyTextSelection(selectionDrag.textLayer, getSelectionPolygon(selectionDrag));
 }
 
 function finishTextSelection(event: PointerEvent): void {
@@ -515,20 +583,32 @@ function pointDistance(a: SelectionPoint, b: SelectionPoint): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-function renderSelectionLasso(drag: SelectionDrag): void {
-  const points = getClosedLassoPoints(drag.points);
+function renderSelectionOutline(drag: SelectionDrag): void {
+  const points = getSelectionPolygon(drag);
   drag.outline.setAttribute("points", points.map((point) => `${point.x},${point.y}`).join(" "));
 }
 
-function getClosedLassoPoints(points: SelectionPoint[]): SelectionPoint[] {
-  if (points.length < 3) {
-    return points;
+function getSelectionPolygon(drag: SelectionDrag): SelectionPoint[] {
+  if (drag.mode === "rectangle") {
+    const start = drag.points[0];
+    const end = drag.points[1] ?? start;
+    return [
+      start,
+      { x: end.x, y: start.y },
+      end,
+      { x: start.x, y: end.y },
+      start
+    ];
   }
 
-  return [...points, points[0]];
+  if (drag.points.length < 3) {
+    return drag.points;
+  }
+
+  return [...drag.points, drag.points[0]];
 }
 
-function applyLassoTextSelection(
+function applyTextSelection(
   textLayer: HTMLElement,
   points: SelectionPoint[]
 ): void {
@@ -773,8 +853,11 @@ function compareTextItemsVisually(a: TextSelectionItem, b: TextSelectionItem): n
 
 async function updateSearch(rawQuery: string): Promise<void> {
   const query = safeText(rawQuery).trim().toLocaleLowerCase();
+  const generation = ++searchGeneration;
+  searchQuery = query;
   matches = [];
   activeMatch = -1;
+  clearSearchHighlights();
   if (!pdfDocument || !query) {
     searchStatus.textContent = "";
     return;
@@ -783,9 +866,14 @@ async function updateSearch(rawQuery: string): Promise<void> {
   setSearchStatus("Searching…");
   for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
     const text = await getPageText(pageNumber);
+    if (generation !== searchGeneration) {
+      return;
+    }
+    let pageMatchIndex = 0;
     let index = text.indexOf(query);
     while (index !== -1) {
-      matches.push({ page: pageNumber, index });
+      matches.push({ page: pageNumber, index, pageMatchIndex });
+      pageMatchIndex += 1;
       index = text.indexOf(query, index + query.length);
     }
   }
@@ -796,6 +884,7 @@ async function updateSearch(rawQuery: string): Promise<void> {
   }
   activeMatch = 0;
   setSearchStatus(`1 of ${matches.length}`);
+  refreshSearchHighlights();
   goToPage(matches[0].page);
 }
 
@@ -820,7 +909,90 @@ function moveMatch(delta: number): void {
   }
   activeMatch = (activeMatch + delta + matches.length) % matches.length;
   setSearchStatus(`${activeMatch + 1} of ${matches.length}`);
+  refreshSearchHighlights();
   goToPage(matches[activeMatch].page);
+}
+
+function refreshSearchHighlights(): void {
+  for (const textLayer of pages.querySelectorAll<HTMLElement>(".textLayer")) {
+    const pageNumber = Number(textLayer.dataset.pageNumber);
+    if (Number.isFinite(pageNumber)) {
+      drawSearchHighlights(textLayer, pageNumber);
+    }
+  }
+}
+
+function clearSearchHighlights(): void {
+  pages.querySelectorAll(".search-highlight").forEach((element) => element.remove());
+}
+
+function drawSearchHighlights(textLayer: HTMLElement, pageNumber: number): void {
+  textLayer.querySelectorAll(".search-highlight").forEach((element) => element.remove());
+  if (!searchQuery) {
+    return;
+  }
+
+  const active = activeMatch >= 0 ? matches[activeMatch] : undefined;
+  const layerRect = textLayer.getBoundingClientRect();
+  const searchable = getSearchableTextFromLayer(textLayer);
+  let pageMatchIndex = 0;
+  let index = searchable.text.toLocaleLowerCase().indexOf(searchQuery);
+  while (index !== -1) {
+    const isActive = active?.page === pageNumber && active.pageMatchIndex === pageMatchIndex;
+    drawSearchMatch(textLayer, layerRect, searchable.segments, index, index + searchQuery.length, isActive);
+    pageMatchIndex += 1;
+    index = searchable.text.toLocaleLowerCase().indexOf(searchQuery, index + searchQuery.length);
+  }
+}
+
+function getSearchableTextFromLayer(textLayer: HTMLElement): { text: string; segments: SearchTextSegment[] } {
+  let text = "";
+  const segments: SearchTextSegment[] = [];
+  for (const span of textLayer.querySelectorAll<HTMLElement>("span[role='presentation']")) {
+    const spanText = span.textContent ?? "";
+    if (!spanText) {
+      continue;
+    }
+    const start = text.length;
+    text += spanText;
+    segments.push({ span, start, end: text.length });
+    text += " ";
+  }
+  return { text, segments };
+}
+
+function drawSearchMatch(
+  textLayer: HTMLElement,
+  layerRect: DOMRect,
+  segments: SearchTextSegment[],
+  start: number,
+  end: number,
+  isActive: boolean
+): void {
+  for (const segment of segments) {
+    const overlapStart = Math.max(start, segment.start);
+    const overlapEnd = Math.min(end, segment.end);
+    if (overlapStart >= overlapEnd || !segment.span.firstChild) {
+      continue;
+    }
+
+    const rect = measureTextNodeRange(
+      segment.span.firstChild,
+      overlapStart - segment.start,
+      overlapEnd - segment.start
+    ) ?? estimateWordRect(segment.span, segment.span.textContent ?? "", overlapStart - segment.start, overlapEnd - segment.start);
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      continue;
+    }
+
+    const highlight = document.createElement("div");
+    highlight.className = isActive ? "search-highlight active" : "search-highlight";
+    highlight.style.left = `${rect.left - layerRect.left}px`;
+    highlight.style.top = `${rect.top - layerRect.top}px`;
+    highlight.style.width = `${Math.max(1, rect.width)}px`;
+    highlight.style.height = `${Math.max(1, rect.height)}px`;
+    textLayer.append(highlight);
+  }
 }
 
 function updatePageControls(): void {

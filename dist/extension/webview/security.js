@@ -33,18 +33,40 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.activate = activate;
-exports.deactivate = deactivate;
-const vscode = __importStar(require("vscode"));
-const constants_1 = require("./extension/constants");
-const pdfReadonlyEditorProvider_1 = require("./extension/pdfReadonlyEditorProvider");
-function activate(context) {
-    context.subscriptions.push(vscode.window.registerCustomEditorProvider(constants_1.VIEW_TYPE, new pdfReadonlyEditorProvider_1.PdfReadonlyEditorProvider(context.extensionUri), {
-        supportsMultipleEditorsPerDocument: true,
-        webviewOptions: {
-            retainContextWhenHidden: true
-        }
-    }));
+exports.createNonce = createNonce;
+exports.sanitizeUiText = sanitizeUiText;
+exports.buildContentSecurityPolicy = buildContentSecurityPolicy;
+exports.escapeAttribute = escapeAttribute;
+const crypto = __importStar(require("node:crypto"));
+function createNonce() {
+    return crypto.randomBytes(16).toString("base64url");
 }
-function deactivate() { }
-//# sourceMappingURL=extension.js.map
+function sanitizeUiText(value, fallback = "") {
+    if (typeof value !== "string") {
+        return fallback;
+    }
+    return value.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 1000);
+}
+function buildContentSecurityPolicy(webview) {
+    const source = webview.cspSource;
+    return [
+        "default-src 'none'",
+        `img-src ${source} data:`,
+        `font-src ${source}`,
+        `style-src ${source}`,
+        `script-src ${source}`,
+        `connect-src ${source}`,
+        "worker-src blob:",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'none'"
+    ].join("; ");
+}
+function escapeAttribute(value) {
+    return value
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+}
+//# sourceMappingURL=security.js.map

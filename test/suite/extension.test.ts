@@ -1,10 +1,15 @@
 import * as assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import * as vscode from "vscode";
-import { VIEW_TYPE } from "../../src/constants";
+import { VIEW_TYPE } from "../../src/extension/constants";
+
+const manifest = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as { name: string; publisher: string };
+const extensionId = `${manifest.publisher}.${manifest.name}`;
 
 suite("VS Code PDF Viewer extension", () => {
   test("is present and contributes the PDF custom editor", () => {
-    const extension = vscode.extensions.getExtension("local.vscode-pdf");
+    const extension = vscode.extensions.getExtension(extensionId);
     assert.ok(extension);
 
     const packageJson = extension.packageJSON as {
@@ -18,7 +23,7 @@ suite("VS Code PDF Viewer extension", () => {
   });
 
   test("activates the provider", async () => {
-    const extension = vscode.extensions.getExtension("local.vscode-pdf");
+    const extension = vscode.extensions.getExtension(extensionId);
     assert.ok(extension);
 
     await extension.activate();
