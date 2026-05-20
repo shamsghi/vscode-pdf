@@ -12,7 +12,6 @@ const pageCount = requireElement("pageCount");
 const zoomOut = requireElement("zoomOut");
 const zoomIn = requireElement("zoomIn");
 const zoomLabel = requireElement("zoomLabel");
-const fitWidth = requireElement("fitWidth");
 const fitPage = requireElement("fitPage");
 const rotate = requireElement("rotate");
 const selectFreestyle = requireElement("selectFreestyle");
@@ -63,7 +62,6 @@ nextPage.addEventListener("click", () => goToPage(currentPage + 1));
 pageNumberInput.addEventListener("change", () => goToPage(Number(pageNumberInput.value)));
 zoomOut.addEventListener("click", () => setScale(scale / 1.2));
 zoomIn.addEventListener("click", () => setScale(scale * 1.2));
-fitWidth.addEventListener("click", () => setFitMode("width"));
 fitPage.addEventListener("click", () => setFitMode("page"));
 rotate.addEventListener("click", () => {
     rotation = (rotation + 90) % 360;
@@ -320,7 +318,7 @@ function getInitialTextSelectionMode() {
         return vscodeStateMode;
     }
     const storedMode = window.localStorage.getItem(selectionModeStorageKey);
-    return isTextSelectionMode(storedMode) ? storedMode : "freestyle";
+    return isTextSelectionMode(storedMode) ? storedMode : "rectangle";
 }
 function setTextSelectionMode(mode) {
     selectionMode = mode;

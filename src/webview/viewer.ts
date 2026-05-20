@@ -90,7 +90,6 @@ const pageCount = requireElement<HTMLElement>("pageCount");
 const zoomOut = requireElement<HTMLButtonElement>("zoomOut");
 const zoomIn = requireElement<HTMLButtonElement>("zoomIn");
 const zoomLabel = requireElement<HTMLElement>("zoomLabel");
-const fitWidth = requireElement<HTMLButtonElement>("fitWidth");
 const fitPage = requireElement<HTMLButtonElement>("fitPage");
 const rotate = requireElement<HTMLButtonElement>("rotate");
 const selectFreestyle = requireElement<HTMLButtonElement>("selectFreestyle");
@@ -148,7 +147,6 @@ nextPage.addEventListener("click", () => goToPage(currentPage + 1));
 pageNumberInput.addEventListener("change", () => goToPage(Number(pageNumberInput.value)));
 zoomOut.addEventListener("click", () => setScale(scale / 1.2));
 zoomIn.addEventListener("click", () => setScale(scale * 1.2));
-fitWidth.addEventListener("click", () => setFitMode("width"));
 fitPage.addEventListener("click", () => setFitMode("page"));
 rotate.addEventListener("click", () => {
   rotation = (rotation + 90) % 360;
@@ -425,7 +423,7 @@ function getInitialTextSelectionMode(): TextSelectionMode {
   }
 
   const storedMode = window.localStorage.getItem(selectionModeStorageKey);
-  return isTextSelectionMode(storedMode) ? storedMode : "freestyle";
+  return isTextSelectionMode(storedMode) ? storedMode : "rectangle";
 }
 
 function setTextSelectionMode(mode: TextSelectionMode): void {
