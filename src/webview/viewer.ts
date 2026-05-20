@@ -173,6 +173,7 @@ window.addEventListener("resize", debounce(() => {
     void rerenderDocumentAtCurrentPage();
   }
 }, 150));
+document.addEventListener("focusin", keepDocumentPinned, true);
 
 updateTextSelectionModeControls();
 
@@ -383,11 +384,24 @@ function scrollToPage(pageNumber: number): void {
     return;
   }
   isProgrammaticScroll = true;
-  pageShell.scrollIntoView({ block: "start" });
+  const pagesRect = pages.getBoundingClientRect();
+  const pageRect = pageShell.getBoundingClientRect();
+  pages.scrollTo({
+    top: pages.scrollTop + pageRect.top - pagesRect.top - 16,
+    behavior: "auto"
+  });
   window.setTimeout(() => {
     isProgrammaticScroll = false;
     updateCurrentPageFromScroll();
   }, 120);
+}
+
+function keepDocumentPinned(): void {
+  if (window.scrollX !== 0 || window.scrollY !== 0) {
+    window.scrollTo(0, 0);
+  }
+  document.documentElement.scrollTop = 0;
+  document.body.scrollTop = 0;
 }
 
 function rerenderDocumentAtCurrentPage(): void {
