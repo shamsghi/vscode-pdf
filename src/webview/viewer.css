@@ -1,4 +1,5 @@
 :root {
+  --webview-top-guard: 18px;
   --toolbar-control-height: max(32px, calc(var(--vscode-font-size, 13px) * 1.55));
   color-scheme: light dark;
   font-family: var(--vscode-font-family);
@@ -20,6 +21,7 @@ body {
 
 body {
   margin: 0;
+  padding-top: var(--webview-top-guard);
   overflow: hidden;
 }
 
@@ -71,7 +73,7 @@ input {
   display: grid;
   grid-template-rows: auto auto 1fr;
   width: 100vw;
-  height: 100%;
+  height: calc(100% - var(--webview-top-guard));
   max-height: 100%;
   min-width: 0;
   min-height: 0;
