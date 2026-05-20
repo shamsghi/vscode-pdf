@@ -1,3 +1,14 @@
+import { pointDistance, type SelectionPoint } from "./selection/geometry.js";
+import {
+  applyTextSelection,
+  estimateTextRangeRect,
+  measureTextNodeRange,
+  normalizeTextLayerSelectionOrder,
+  selectedItemsToText,
+  type TextSelectionItem
+} from "./selection/text.js";
+import { base64ToBytes, clamp, debounce, errorMessage, requireElement, safeText } from "./shared/dom.js";
+
 declare function acquireVsCodeApi(): {
   postMessage(message: unknown): void;
   getState(): ViewerState | undefined;
@@ -39,19 +50,6 @@ type PdfTextContent = {
 type ExtensionMessage =
   | { type: "loadPdf"; requestId: number; fileName: string; dataBase64: string }
   | { type: "loadError"; requestId: number; fileName: string; message: string };
-
-type TextSelectionItem = {
-  text: string;
-  top: number;
-  left: number;
-  right: number;
-  height: number;
-};
-
-type SelectionPoint = {
-  x: number;
-  y: number;
-};
 
 type TextSelectionMode = "freestyle" | "rectangle";
 
@@ -420,54 +418,6 @@ function updateCurrentPageFromScroll(): void {
   }
 }
 
-function normalizeTextLayerSelectionOrder(container: HTMLElement): void {
-  const textSpans = Array.from(container.querySelectorAll<HTMLElement>("span[role='presentation']"));
-  if (textSpans.length < 2) {
-    return;
-  }
-
-  const containerRect = container.getBoundingClientRect();
-  const orderedSpans = textSpans
-    .map((span, originalIndex) => {
-      const rect = span.getBoundingClientRect();
-      return {
-        span,
-        originalIndex,
-        top: rect.top - containerRect.top,
-        left: rect.left - containerRect.left,
-        height: rect.height
-      };
-    })
-    .sort((a, b) => {
-      const lineTolerance = Math.max(3, Math.min(a.height || 0, b.height || 0) * 0.45);
-      if (Math.abs(a.top - b.top) > lineTolerance) {
-        return a.top - b.top;
-      }
-      if (Math.abs(a.left - b.left) > 1) {
-        return a.left - b.left;
-      }
-      return a.originalIndex - b.originalIndex;
-    });
-
-  const fragment = document.createDocumentFragment();
-  let previousTop: number | undefined;
-  for (const item of orderedSpans) {
-    if (previousTop !== undefined && Math.abs(item.top - previousTop) > Math.max(4, item.height * 0.6)) {
-      const lineBreak = document.createElement("br");
-      lineBreak.setAttribute("role", "presentation");
-      fragment.append(lineBreak);
-    }
-    fragment.append(item.span);
-    previousTop = item.top;
-  }
-
-  const endOfContent = container.querySelector(".endOfContent");
-  container.replaceChildren(fragment);
-  if (endOfContent) {
-    container.append(endOfContent);
-  }
-}
-
 function getInitialTextSelectionMode(): TextSelectionMode {
   const vscodeStateMode = vscode.getState()?.selectionMode;
   if (isTextSelectionMode(vscodeStateMode)) {
@@ -559,7 +509,7 @@ function updateTextSelection(event: PointerEvent): void {
   }
 
   renderSelectionOutline(selectionDrag);
-  applyTextSelection(selectionDrag.textLayer, getSelectionPolygon(selectionDrag));
+  selectedTextItems = applyTextSelection(selectionDrag.textLayer, getSelectionPolygon(selectionDrag));
 }
 
 function finishTextSelection(event: PointerEvent): void {
@@ -577,10 +527,6 @@ function eventToSelectionPoint(event: PointerEvent, contentRect: DOMRect): Selec
     x: clamp(event.clientX - contentRect.left, 0, contentRect.width),
     y: clamp(event.clientY - contentRect.top, 0, contentRect.height)
   };
-}
-
-function pointDistance(a: SelectionPoint, b: SelectionPoint): number {
-  return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
 function renderSelectionOutline(drag: SelectionDrag): void {
@@ -608,99 +554,6 @@ function getSelectionPolygon(drag: SelectionDrag): SelectionPoint[] {
   return [...drag.points, drag.points[0]];
 }
 
-function applyTextSelection(
-  textLayer: HTMLElement,
-  points: SelectionPoint[]
-): void {
-  const layerRect = textLayer.getBoundingClientRect();
-  textLayer.querySelectorAll(".custom-selection-highlight").forEach((element) => element.remove());
-  selectedTextItems = [];
-  if (points.length < 3) {
-    return;
-  }
-
-  for (const span of Array.from(textLayer.querySelectorAll<HTMLElement>("span[role='presentation']"))) {
-    for (const item of getSelectableWordItems(span, layerRect)) {
-      if (lassoIntersectsRect(points, {
-        left: item.left,
-        top: item.top,
-        right: item.right,
-        bottom: item.top + item.height
-      })) {
-        selectedTextItems.push(item);
-        drawSelectionHighlight(textLayer, item);
-      }
-    }
-  }
-
-  selectedTextItems.sort(compareTextItemsVisually);
-}
-
-function getSelectableWordItems(span: HTMLElement, layerRect: DOMRect): TextSelectionItem[] {
-  const text = span.textContent ?? "";
-  if (!text.trim() || !span.firstChild) {
-    return [];
-  }
-
-  const items: TextSelectionItem[] = [];
-  const matcher = /\S+/g;
-  for (const match of text.matchAll(matcher)) {
-    const word = match[0];
-    const start = match.index ?? 0;
-    const end = start + word.length;
-    const rect = measureTextNodeRange(span.firstChild, start, end) ?? estimateWordRect(span, text, start, end);
-    if (!rect || rect.width <= 0 || rect.height <= 0) {
-      continue;
-    }
-    items.push({
-      text: word,
-      top: rect.top - layerRect.top,
-      left: rect.left - layerRect.left,
-      right: rect.right - layerRect.left,
-      height: rect.height
-    });
-  }
-
-  return items;
-}
-
-function measureTextNodeRange(node: ChildNode, start: number, end: number): DOMRect | undefined {
-  if (node.nodeType !== Node.TEXT_NODE) {
-    return undefined;
-  }
-
-  const range = document.createRange();
-  try {
-    range.setStart(node, start);
-    range.setEnd(node, end);
-    const rect = range.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 ? rect : undefined;
-  } finally {
-    range.detach();
-  }
-}
-
-function estimateWordRect(span: HTMLElement, text: string, start: number, end: number): DOMRect | undefined {
-  const rect = span.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0 || text.length === 0) {
-    return undefined;
-  }
-
-  const left = rect.left + rect.width * (start / text.length);
-  const right = rect.left + rect.width * (end / text.length);
-  return new DOMRect(left, rect.top, right - left, rect.height);
-}
-
-function drawSelectionHighlight(textLayer: HTMLElement, item: TextSelectionItem): void {
-  const highlight = document.createElement("div");
-  highlight.className = "custom-selection-highlight";
-  highlight.style.left = `${item.left}px`;
-  highlight.style.top = `${item.top}px`;
-  highlight.style.width = `${Math.max(1, item.right - item.left)}px`;
-  highlight.style.height = `${Math.max(1, item.height)}px`;
-  textLayer.append(highlight);
-}
-
 function copySelectedText(event: ClipboardEvent): void {
   if (selectedTextItems.length === 0 || !event.clipboardData) {
     return;
@@ -710,145 +563,12 @@ function copySelectedText(event: ClipboardEvent): void {
   event.clipboardData.setData("text/plain", selectedItemsToText(selectedTextItems));
 }
 
-function selectedItemsToText(items: TextSelectionItem[]): string {
-  const lines: TextSelectionItem[][] = [];
-  for (const item of items) {
-    const lastLine = lines.at(-1);
-    const tolerance = Math.max(4, item.height * 0.7);
-    if (!lastLine || Math.abs(lastLine[0].top - item.top) > tolerance) {
-      lines.push([item]);
-    } else {
-      lastLine.push(item);
-    }
-  }
-
-  return lines
-    .map((line) => line
-      .sort((a, b) => a.left - b.left)
-      .map((item) => item.text)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim())
-    .filter(Boolean)
-    .join("\n");
-}
-
 function clearTextSelection(): void {
   selectionDrag?.overlay.remove();
   selectionDrag = undefined;
   pages.querySelectorAll(".custom-selection-highlight").forEach((element) => element.remove());
   selectedTextItems = [];
   window.getSelection()?.removeAllRanges();
-}
-
-function lassoIntersectsRect(
-  points: SelectionPoint[],
-  rect: { left: number; top: number; right: number; bottom: number }
-): boolean {
-  const center = {
-    x: rect.left + (rect.right - rect.left) / 2,
-    y: rect.top + (rect.bottom - rect.top) / 2
-  };
-  if (pointInPolygon(center, points)) {
-    return true;
-  }
-
-  const rectCorners = [
-    { x: rect.left, y: rect.top },
-    { x: rect.right, y: rect.top },
-    { x: rect.right, y: rect.bottom },
-    { x: rect.left, y: rect.bottom }
-  ];
-  if (rectCorners.some((corner) => pointInPolygon(corner, points))) {
-    return true;
-  }
-
-  return polygonIntersectsRect(points, rectCorners);
-}
-
-function pointInPolygon(point: SelectionPoint, polygon: SelectionPoint[]): boolean {
-  let inside = false;
-  for (let index = 0, previousIndex = polygon.length - 1; index < polygon.length; previousIndex = index, index += 1) {
-    const current = polygon[index];
-    const previous = polygon[previousIndex];
-    const crossesY = current.y > point.y !== previous.y > point.y;
-    if (!crossesY) {
-      continue;
-    }
-
-    const crossingX = ((previous.x - current.x) * (point.y - current.y)) / (previous.y - current.y) + current.x;
-    if (point.x < crossingX) {
-      inside = !inside;
-    }
-  }
-
-  return inside;
-}
-
-function polygonIntersectsRect(
-  polygon: SelectionPoint[],
-  rectCorners: [SelectionPoint, SelectionPoint, SelectionPoint, SelectionPoint] | SelectionPoint[]
-): boolean {
-  const rectEdges = [
-    [rectCorners[0], rectCorners[1]],
-    [rectCorners[1], rectCorners[2]],
-    [rectCorners[2], rectCorners[3]],
-    [rectCorners[3], rectCorners[0]]
-  ] as const;
-
-  for (let index = 0; index < polygon.length; index += 1) {
-    const nextIndex = (index + 1) % polygon.length;
-    const polygonEdge = [polygon[index], polygon[nextIndex]] as const;
-    if (rectEdges.some((rectEdge) => segmentsIntersect(polygonEdge[0], polygonEdge[1], rectEdge[0], rectEdge[1]))) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function segmentsIntersect(a: SelectionPoint, b: SelectionPoint, c: SelectionPoint, d: SelectionPoint): boolean {
-  const directionA = segmentDirection(a, b, c);
-  const directionB = segmentDirection(a, b, d);
-  const directionC = segmentDirection(c, d, a);
-  const directionD = segmentDirection(c, d, b);
-
-  if (directionA === 0 && pointOnSegment(c, a, b)) {
-    return true;
-  }
-  if (directionB === 0 && pointOnSegment(d, a, b)) {
-    return true;
-  }
-  if (directionC === 0 && pointOnSegment(a, c, d)) {
-    return true;
-  }
-  if (directionD === 0 && pointOnSegment(b, c, d)) {
-    return true;
-  }
-
-  return directionA > 0 !== directionB > 0 && directionC > 0 !== directionD > 0;
-}
-
-function segmentDirection(a: SelectionPoint, b: SelectionPoint, c: SelectionPoint): number {
-  return (c.x - a.x) * (b.y - a.y) - (b.x - a.x) * (c.y - a.y);
-}
-
-function pointOnSegment(point: SelectionPoint, start: SelectionPoint, end: SelectionPoint): boolean {
-  return point.x >= Math.min(start.x, end.x)
-    && point.x <= Math.max(start.x, end.x)
-    && point.y >= Math.min(start.y, end.y)
-    && point.y <= Math.max(start.y, end.y);
-}
-
-function compareTextItemsVisually(a: TextSelectionItem, b: TextSelectionItem): number {
-  const lineTolerance = Math.max(4, Math.min(a.height || 0, b.height || 0) * 0.7);
-  if (Math.abs(a.top - b.top) > lineTolerance) {
-    return a.top - b.top;
-  }
-  if (Math.abs(a.left - b.left) > 1) {
-    return a.left - b.left;
-  }
-  return 0;
 }
 
 async function updateSearch(rawQuery: string): Promise<void> {
@@ -980,7 +700,7 @@ function drawSearchMatch(
       segment.span.firstChild,
       overlapStart - segment.start,
       overlapEnd - segment.start
-    ) ?? estimateWordRect(segment.span, segment.span.textContent ?? "", overlapStart - segment.start, overlapEnd - segment.start);
+    ) ?? estimateTextRangeRect(segment.span, segment.span.textContent ?? "", overlapStart - segment.start, overlapEnd - segment.start);
     if (!rect || rect.width <= 0 || rect.height <= 0) {
       continue;
     }
@@ -1020,15 +740,6 @@ function showError(message: string): void {
   vscode.postMessage({ type: "viewerError", message });
 }
 
-function base64ToBytes(value: string): Uint8Array {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
-}
-
 function isExtensionMessage(value: unknown): value is ExtensionMessage {
   if (!value || typeof value !== "object") {
     return false;
@@ -1038,33 +749,4 @@ function isExtensionMessage(value: unknown): value is ExtensionMessage {
     return typeof candidate.requestId === "number" && typeof candidate.fileName === "string" && typeof candidate.dataBase64 === "string";
   }
   return candidate.type === "loadError" && typeof candidate.requestId === "number" && typeof candidate.fileName === "string" && typeof candidate.message === "string";
-}
-
-function requireElement<T extends HTMLElement>(id: string): T {
-  const element = document.getElementById(id);
-  if (!element) {
-    throw new Error(`Missing element: ${id}`);
-  }
-  return element as T;
-}
-
-function safeText(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 1000) : fallback;
-}
-
-function errorMessage(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
-  return safeText(raw, "Unable to display PDF.");
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(Math.max(value, min), max);
-}
-
-function debounce(callback: () => void, delayMs: number): () => void {
-  let handle = 0;
-  return () => {
-    window.clearTimeout(handle);
-    handle = window.setTimeout(callback, delayMs);
-  };
 }
