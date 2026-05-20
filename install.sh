@@ -2,24 +2,68 @@
 set -euo pipefail
 
 repo="shamsghi/vscode-pdf"
-asset_url="https://github.com/${repo}/releases/latest/download/vscode-pdf.vsix"
+extension_id="shamsghi.vscode-pdf"
+release_api_url="https://api.github.com/repos/${repo}/releases/latest"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
+
+fail() {
+  echo "Error: $*" >&2
+  exit 1
+}
 
 if command -v code >/dev/null 2>&1; then
   code_cmd="code"
 elif command -v code-insiders >/dev/null 2>&1; then
   code_cmd="code-insiders"
 else
-  echo "VS Code CLI not found. In VS Code, run: Shell Command: Install 'code' command in PATH" >&2
-  exit 1
+  fail "VS Code CLI not found. In VS Code, run: Shell Command: Install 'code' command in PATH"
+fi
+
+echo "Resolving latest VS Code PDF Viewer release..."
+release_json="${tmp_dir}/release.json"
+curl -fsSL \
+  -H "Accept: application/vnd.github+json" \
+  -H "User-Agent: vscode-pdf-installer" \
+  "$release_api_url" \
+  -o "$release_json" || fail "Unable to fetch latest release metadata from GitHub"
+
+asset_url="$(
+  sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\.vsix\)".*/\1/p' "$release_json" \
+    | awk '
+      /\/vscode-pdf\.vsix$/ { preferred = $0 }
+      first == "" { first = $0 }
+      END {
+        if (preferred != "") {
+          print preferred
+        } else {
+          print first
+        }
+      }
+    '
+)"
+
+if [ -z "$asset_url" ]; then
+  fail "Latest release does not include a .vsix asset"
 fi
 
 vsix="${tmp_dir}/vscode-pdf.vsix"
-echo "Downloading VS Code PDF Viewer..."
-curl -fL "$asset_url" -o "$vsix"
+echo "Downloading VS Code PDF Viewer from ${asset_url}..."
+curl -fL "$asset_url" -o "$vsix" || fail "Unable to download VSIX asset"
+
+if [ ! -s "$vsix" ]; then
+  fail "Downloaded VSIX is empty"
+fi
+
+if command -v unzip >/dev/null 2>&1 && ! unzip -tq "$vsix" >/dev/null 2>&1; then
+  fail "Downloaded VSIX is not a valid zip archive"
+fi
 
 echo "Installing with ${code_cmd}..."
-"$code_cmd" --install-extension "$vsix" --force
+"$code_cmd" --install-extension "$vsix" --force || fail "VS Code failed to install the extension"
+
+if ! "$code_cmd" --list-extensions | grep -Fxq "$extension_id"; then
+  fail "VS Code did not report ${extension_id} after installation"
+fi
 
 echo "Installed. Reload VS Code if the PDF viewer was already open."
