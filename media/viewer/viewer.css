@@ -1,5 +1,5 @@
 :root {
-  --webview-top-guard: 18px;
+  --webview-top-guard: 2px;
   --toolbar-control-height: max(32px, calc(var(--vscode-font-size, 13px) * 1.55));
   color-scheme: light dark;
   font-family: var(--vscode-font-family);
