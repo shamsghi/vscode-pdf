@@ -1,26 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=scripts/lib/editor-cli.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/lib/editor-cli.sh"
+
 repo="shamsghi/vscode-pdf"
 extension_id="shamsghi.vscode-pdf"
 release_api_url="https://api.github.com/repos/${repo}/releases/latest"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
+requested_editor=""
 
-fail() {
-  echo "Error: $*" >&2
-  exit 1
+usage() {
+  cat <<'EOF'
+Usage: install.sh [options]
+
+Install the latest VS Code PDF Viewer release from GitHub.
+
+Options:
+  --editor <name>   Install into cursor, code, or code-insiders (skips menu)
+  -h, --help        Show this help
+
+Environment:
+  VSCODE_PDF_EDITOR   Same as --editor (non-interactive)
+
+When several editor CLIs are on PATH and neither is set, you are prompted to choose.
+EOF
 }
 
-if command -v code >/dev/null 2>&1; then
-  code_cmd="code"
-elif command -v code-insiders >/dev/null 2>&1; then
-  code_cmd="code-insiders"
-else
-  fail "VS Code CLI not found. In VS Code, run: Shell Command: Install 'code' command in PATH"
-fi
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --editor)
+      [ $# -ge 2 ] || fail "Missing value for --editor"
+      requested_editor="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "Unknown option: $1 (try --help)"
+      ;;
+  esac
+done
 
-echo "Resolving latest VS Code PDF Viewer release..."
+install_ui_title "VS Code PDF Viewer — release install"
+
+install_ui_step "Selecting editor"
+editor_cmd="$(resolve_editor_cli "$requested_editor")"
+editor_name="$(editor_display_name "$(editor_cli_id "$editor_cmd")")"
+
+install_ui_step "Resolving latest GitHub release"
+step_start="$SECONDS"
 release_json="${tmp_dir}/release.json"
 curl -fsSL \
   -H "Accept: application/vnd.github+json" \
@@ -55,39 +87,28 @@ if [ -z "$asset_url" ]; then
   fail "Latest release does not include a .vsix asset"
 fi
 
-vsix="${tmp_dir}/vscode-pdf.vsix"
 if [ -n "$release_tag" ]; then
-  echo "Latest release: ${release_tag}"
+  install_ui_ok "Latest release ${release_tag} ($(install_ui_elapsed "$step_start"))"
+else
+  install_ui_ok "Release metadata fetched ($(install_ui_elapsed "$step_start"))"
 fi
 
-echo "Downloading VS Code PDF Viewer from ${asset_url}..."
-curl -fL "$asset_url" -o "$vsix" || fail "Unable to download VSIX asset"
+install_ui_step "Downloading VSIX"
+step_start="$SECONDS"
+vsix="${tmp_dir}/vscode-pdf.vsix"
+install_ui_detail "$asset_url"
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  curl -fL --progress-bar "$asset_url" -o "$vsix" \
+    || fail "Unable to download VSIX asset"
+else
+  curl -fLsS "$asset_url" -o "$vsix" \
+    || fail "Unable to download VSIX asset"
+fi
 
 if [ ! -s "$vsix" ]; then
   fail "Downloaded VSIX is empty"
 fi
 
-if command -v unzip >/dev/null 2>&1 && ! unzip -tq "$vsix" >/dev/null 2>&1; then
-  fail "Downloaded VSIX is not a valid zip archive"
-fi
+install_ui_ok "Downloaded $(install_ui_elapsed "$step_start")"
 
-if command -v unzip >/dev/null 2>&1; then
-  package_version="$(
-    unzip -p "$vsix" extension/package.json \
-      | sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p' \
-      | head -n 1
-  )"
-
-  if [ -n "$package_version" ]; then
-    echo "Extension package version: ${package_version}"
-  fi
-fi
-
-echo "Installing with ${code_cmd}..."
-"$code_cmd" --install-extension "$vsix" --force || fail "VS Code failed to install the extension"
-
-if ! "$code_cmd" --list-extensions | grep -Fxq "$extension_id"; then
-  fail "VS Code did not report ${extension_id} after installation"
-fi
-
-echo "Installed. Reload VS Code if the PDF viewer was already open."
+install_extension_vsix "$editor_cmd" "$editor_name" "$extension_id" "$vsix"

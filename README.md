@@ -6,13 +6,41 @@ The extension does not launch external applications, run local servers, load CDN
 
 ## Install
 
-Run this command:
+Run this command (works with **VS Code** and **Cursor**):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shamsghi/vscode-pdf/main/install.sh | bash
 ```
 
-Then reload VS Code if a PDF viewer tab was already open.
+The installer always asks which editor to use (`cursor`, `code`, or `code-insiders`). It finds CLIs on your PATH and in standard app install locations (e.g. `/Applications/Cursor.app/...` on macOS). Skip the menu with `--editor cursor` or `VSCODE_PDF_EDITOR=cursor`.
+
+Then reload your editor if a PDF viewer tab was already open.
+
+The extension targets VS Code `^1.74.0`, which includes current **Cursor** builds (Cursor reports its embedded VS Code version when installing extensions).
+
+## Local install (test before shipping)
+
+From a clone of this repo, build a `.vsix` from your working tree and install it into VS Code or Cursor (same flow as a release, without downloading from GitHub):
+
+```sh
+pnpm install
+pnpm install:local
+```
+
+Or run the script directly:
+
+```sh
+./install-local.sh
+./install-local.sh --editor cursor
+```
+
+Options:
+
+- `--editor <name>` — install into `cursor`, `code`, or `code-insiders` without a menu
+- `--skip-build` — package and install using an existing compile
+- `--skip-package` — reinstall `vscode-pdf.vsix` only (after `pnpm package`)
+
+After install, reload the editor and open any `.pdf` file to exercise the viewer. Bump `version` in `package.json` when you need to confirm an upgrade replaced an older build (`--force` is used automatically).
 
 ## Safety review prompt
 

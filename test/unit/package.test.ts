@@ -12,7 +12,7 @@ const packageJson = JSON.parse(readFileSync(join(process.cwd(), "package.json"),
 describe("extension manifest", () => {
   it("registers the PDF custom editor as the default viewer", () => {
     expect(packageJson.activationEvents).toContain("onCustomEditor:vscode-pdf.viewer");
-    expect(packageJson.engines.vscode).toBe("^1.120.0");
+    expect(packageJson.engines.vscode).toBe("^1.74.0");
     expect(packageJson.capabilities.untrustedWorkspaces.supported).toBe(true);
 
     const editor = packageJson.contributes.customEditors[0];

@@ -12,7 +12,7 @@
   "type": "commonjs",
   "main": "./dist/extension.js",
   "engines": {
-    "vscode": "^1.120.0"
+    "vscode": "^1.74.0"
   },
   "categories": [
     "Other"
@@ -49,7 +49,8 @@
     "test:unit": "vitest run",
     "test:extension": "sfw pnpm compile && node ./out-test/test/runTest.js",
     "test": "sfw pnpm compile && sfw pnpm test:unit && sfw pnpm test:extension",
-    "package": "rm -f vscode-pdf*.vsix && sfw pnpm compile && sfw pnpm exec vsce package --no-dependencies --allow-missing-repository && node -e \"const fs=require('fs'); const p=require('./package.json'); fs.copyFileSync('vscode-pdf-' + p.version + '.vsix', 'vscode-pdf.vsix')\""
+    "package": "rm -f vscode-pdf*.vsix && sfw pnpm compile && sfw pnpm exec vsce package --no-dependencies --allow-missing-repository && node -e \"const fs=require('fs'); const p=require('./package.json'); fs.copyFileSync('vscode-pdf-' + p.version + '.vsix', 'vscode-pdf.vsix')\"",
+    "install:local": "bash ./scripts/install-local.sh"
   },
   "dependencies": {
     "pdfjs-dist": "^5.7.284"
@@ -57,19 +58,12 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.6.0",
-    "@types/vscode": "^1.118.0",
+    "@types/vscode": "^1.74.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.1",
     "mocha": "^11.7.5",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
-  },
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": "^11.1.1",
-      "onFail": "download"
-    }
   },
   "pnpm": {
     "ignoredBuiltDependencies": [
