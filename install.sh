@@ -1,15 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# shellcheck source=scripts/lib/editor-cli.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/lib/editor-cli.sh"
-
 repo="shamsghi/vscode-pdf"
 extension_id="shamsghi.vscode-pdf"
 release_api_url="https://api.github.com/repos/${repo}/releases/latest"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 requested_editor=""
+
+load_editor_cli_lib() {
+  local script_dir=""
+  local lib_path=""
+
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    lib_path="${script_dir}/scripts/lib/editor-cli.sh"
+  fi
+
+  if [ -n "$lib_path" ] && [ -f "$lib_path" ]; then
+    # shellcheck source=scripts/lib/editor-cli.sh
+    source "$lib_path"
+    return
+  fi
+
+  lib_path="${tmp_dir}/editor-cli.sh"
+  curl -fsSL \
+    -H "User-Agent: vscode-pdf-installer" \
+    "https://raw.githubusercontent.com/${repo}/main/scripts/lib/editor-cli.sh" \
+    -o "$lib_path" \
+    || {
+      echo "Error: Unable to fetch editor helper library from GitHub" >&2
+      exit 1
+    }
+  # shellcheck source=/dev/null
+  source "$lib_path"
+}
+
+load_editor_cli_lib
 
 usage() {
   cat <<'EOF'
