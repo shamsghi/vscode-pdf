@@ -12,5 +12,5 @@
     "types": ["node", "vscode", "mocha"]
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "exclude": ["src/webview/**", "src/**/*.test.ts"]
+  "exclude": ["src/webview/**", "src/**/*.test.ts", "test/unit/**"]
 }
