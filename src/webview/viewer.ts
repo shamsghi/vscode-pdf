@@ -1,11 +1,6 @@
-import { pointDistance, type SelectionPoint } from "./selection/geometry.js";
-import {
-  applyTextSelection,
-  estimateTextRangeRect,
-  measureTextNodeRange,
-  selectedItemsToText,
-  type TextSelectionItem
-} from "./selection/text.js";
+import { createSelectionInteraction } from "./selection/interaction.js";
+import { type TextSelectionMode } from "./selection/text.js";
+import { createSearchHandlers } from "./search.js";
 import { base64ToBytes, clamp, debounce, errorMessage, requireElement, safeText } from "./shared/dom.js";
 
 declare function acquireVsCodeApi(): {
@@ -50,35 +45,6 @@ type ExtensionMessage =
   | { type: "loadPdf"; requestId: number; fileName: string; dataBase64: string }
   | { type: "loadError"; requestId: number; fileName: string; message: string };
 
-type TextSelectionMode = "freestyle" | "rectangle";
-
-type SelectionDrag = {
-  pageContent: HTMLElement;
-  textLayer: HTMLElement;
-  overlay: SVGSVGElement;
-  outline: SVGPolygonElement;
-  mode: TextSelectionMode;
-  points: SelectionPoint[];
-  pageNumber: number;
-};
-
-type SelectionFrame = {
-  pageContent: HTMLElement;
-  overlay: SVGSVGElement;
-};
-
-type SearchMatch = {
-  page: number;
-  index: number;
-  pageMatchIndex: number;
-};
-
-type SearchTextSegment = {
-  span: HTMLElement;
-  start: number;
-  end: number;
-};
-
 type ViewerState = {
   selectionMode?: TextSelectionMode;
 };
@@ -105,8 +71,6 @@ const searchStatus = requireElement<HTMLElement>("searchStatus");
 
 const pdfModuleUri = app.dataset.pdfModuleUri;
 const pdfWorkerUri = app.dataset.pdfWorkerUri;
-const svgNamespace = "http://www.w3.org/2000/svg";
-const minLassoPointDistance = 2;
 const selectionModeStorageKey = "vscode-pdf.selectionMode";
 
 let pdfjs: PdfJsModule | undefined;
@@ -116,10 +80,6 @@ let scale = 1;
 let rotation = 0;
 let fitMode: "custom" | "width" | "page" = "width";
 let textCache = new Map<number, string>();
-let searchQuery = "";
-let searchGeneration = 0;
-let matches: SearchMatch[] = [];
-let activeMatch = -1;
 let pageShells = new Map<number, HTMLElement>();
 let renderedPages = new Set<number>();
 let renderingPages = new Set<number>();
@@ -127,9 +87,15 @@ let pageObserver: IntersectionObserver | undefined;
 let renderGeneration = 0;
 let isProgrammaticScroll = false;
 let selectionMode: TextSelectionMode = getInitialTextSelectionMode();
-let selectionDrag: SelectionDrag | undefined;
-let selectionFrame: SelectionFrame | undefined;
-let selectedTextItems: TextSelectionItem[] = [];
+
+const selection = createSelectionInteraction(pages, () => selectionMode);
+const search = createSearchHandlers({
+  pages,
+  searchStatus,
+  getPageCount: () => pdfDocument?.numPages ?? 0,
+  getPageText,
+  goToPage
+});
 
 void initialize();
 
@@ -159,18 +125,18 @@ rotate.addEventListener("click", () => {
 });
 selectFreestyle.addEventListener("click", () => setTextSelectionMode("freestyle"));
 selectRectangle.addEventListener("click", () => setTextSelectionMode("rectangle"));
-searchInput.addEventListener("input", () => void updateSearch(searchInput.value));
-searchPrev.addEventListener("click", () => moveMatch(-1));
-searchNext.addEventListener("click", () => moveMatch(1));
+searchInput.addEventListener("input", () => void search.updateSearch(searchInput.value));
+searchPrev.addEventListener("click", () => search.moveMatch(-1));
+searchNext.addEventListener("click", () => search.moveMatch(1));
 pages.addEventListener("scroll", debounce(updateCurrentPageFromScroll, 80));
-pages.addEventListener("pointerdown", beginTextSelection);
-pages.addEventListener("pointermove", updateTextSelection);
-pages.addEventListener("pointerup", finishTextSelection);
-pages.addEventListener("pointercancel", finishTextSelection);
-document.addEventListener("copy", copySelectedText);
+pages.addEventListener("pointerdown", (event) => selection.begin(event));
+pages.addEventListener("pointermove", (event) => selection.update(event));
+pages.addEventListener("pointerup", (event) => selection.finish(event));
+pages.addEventListener("pointercancel", (event) => selection.finish(event));
+document.addEventListener("copy", (event) => selection.copy(event));
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    clearTextSelection();
+    selection.clear();
   }
 });
 window.addEventListener("resize", debounce(() => {
@@ -211,10 +177,7 @@ async function loadPdf(dataBase64: string, fileName: string): Promise<void> {
     setStatus(`Loading ${safeText(fileName, "PDF")}…`);
     await pdfDocument?.destroy();
     textCache = new Map();
-    searchQuery = "";
-    searchGeneration += 1;
-    matches = [];
-    activeMatch = -1;
+    search.reset();
     pdfDocument = await pdfjs.getDocument({
       data: base64ToBytes(dataBase64),
       useSystemFonts: true
@@ -339,7 +302,7 @@ async function renderPage(pageNumber: number, generation: number): Promise<void>
     }).render();
     textLayerContainer.dataset.pageNumber = String(pageNumber);
     syncPageContentScale(pageShell, pageContent, pageWidth, pageHeight);
-    drawSearchHighlights(textLayerContainer, pageNumber);
+    search.drawPageHighlights(textLayerContainer, pageNumber);
     renderedPages.add(pageNumber);
     updatePageControls();
   } catch (error) {
@@ -481,7 +444,7 @@ function setTextSelectionMode(mode: TextSelectionMode): void {
   vscode.setState({ selectionMode });
   window.localStorage.setItem(selectionModeStorageKey, selectionMode);
   updateTextSelectionModeControls();
-  clearTextSelection();
+  selection.clear();
 }
 
 function updateTextSelectionModeControls(): void {
@@ -491,189 +454,6 @@ function updateTextSelectionModeControls(): void {
 
 function isTextSelectionMode(value: unknown): value is TextSelectionMode {
   return value === "freestyle" || value === "rectangle";
-}
-
-function beginTextSelection(event: PointerEvent): void {
-  if (event.button !== 0) {
-    return;
-  }
-
-  const target = event.target;
-  if (!(target instanceof Element)) {
-    return;
-  }
-
-  const textLayer = target.closest<HTMLElement>(".textLayer");
-  const pageContent = target.closest<HTMLElement>(".page-content");
-  if (!textLayer || !pageContent) {
-    clearTextSelection();
-    return;
-  }
-
-  event.preventDefault();
-  pages.setPointerCapture(event.pointerId);
-  clearTextSelection();
-
-  const layerRect = textLayer.getBoundingClientRect();
-  const overlay = document.createElementNS(svgNamespace, "svg");
-  overlay.classList.add("selection-lasso");
-  overlay.classList.add(`selection-${selectionMode}`);
-  overlay.setAttribute("width", `${layerRect.width}`);
-  overlay.setAttribute("height", `${layerRect.height}`);
-  overlay.setAttribute("viewBox", `0 0 ${layerRect.width} ${layerRect.height}`);
-  const outline = document.createElementNS(svgNamespace, "polygon");
-  outline.classList.add("selection-lasso-outline");
-  overlay.append(outline);
-  textLayer.append(overlay);
-
-  selectionDrag = {
-    pageContent,
-    textLayer,
-    overlay,
-    outline,
-    mode: selectionMode,
-    points: [eventToSelectionPoint(event, layerRect)],
-    pageNumber: Number(textLayer.dataset.pageNumber) || 0
-  };
-
-  updateTextSelection(event);
-}
-
-function updateTextSelection(event: PointerEvent): void {
-  if (!selectionDrag) {
-    return;
-  }
-
-  event.preventDefault();
-  const layerRect = selectionDrag.textLayer.getBoundingClientRect();
-  const point = eventToSelectionPoint(event, layerRect);
-  if (selectionDrag.mode === "rectangle") {
-    selectionDrag.points[1] = point;
-  } else {
-    const previousPoint = selectionDrag.points.at(-1);
-    if (!previousPoint || pointDistance(previousPoint, point) >= minLassoPointDistance) {
-      selectionDrag.points.push(point);
-    }
-  }
-
-  renderSelectionOutline(selectionDrag);
-  selectedTextItems = applyTextSelection(
-    selectionDrag.textLayer,
-    getSelectionPolygon(selectionDrag),
-    selectionDrag.mode
-  );
-}
-
-function finishTextSelection(event: PointerEvent): void {
-  if (!selectionDrag) {
-    return;
-  }
-
-  event.preventDefault();
-  const polygon = getSelectionPolygon(selectionDrag);
-  if (selectedTextItems.length > 0 && polygon.length >= 3) {
-    removeSelectionFrame();
-    renderSelectionOutline(selectionDrag, polygon);
-    selectionDrag.overlay.classList.add("selection-lasso--committed");
-    selectionFrame = {
-      pageContent: selectionDrag.pageContent,
-      overlay: selectionDrag.overlay
-    };
-  } else {
-    selectionDrag.overlay.remove();
-  }
-  selectionDrag = undefined;
-}
-
-function eventToSelectionPoint(event: PointerEvent, contentRect: DOMRect): SelectionPoint {
-  return {
-    x: clamp(event.clientX - contentRect.left, 0, contentRect.width),
-    y: clamp(event.clientY - contentRect.top, 0, contentRect.height)
-  };
-}
-
-function renderSelectionOutline(drag: SelectionDrag, points = getSelectionPolygon(drag)): void {
-  drag.outline.setAttribute("points", points.map((point) => `${point.x},${point.y}`).join(" "));
-}
-
-function getSelectionPolygon(drag: SelectionDrag): SelectionPoint[] {
-  if (drag.mode === "rectangle") {
-    const start = drag.points[0];
-    const end = drag.points[1] ?? start;
-    return [
-      start,
-      { x: end.x, y: start.y },
-      end,
-      { x: start.x, y: end.y },
-      start
-    ];
-  }
-
-  if (drag.points.length < 3) {
-    return drag.points;
-  }
-
-  return [...drag.points, drag.points[0]];
-}
-
-function copySelectedText(event: ClipboardEvent): void {
-  if (selectedTextItems.length === 0 || !event.clipboardData) {
-    return;
-  }
-
-  event.preventDefault();
-  event.clipboardData.setData("text/plain", selectedItemsToText(selectedTextItems));
-}
-
-function clearTextSelection(): void {
-  selectionDrag?.overlay.remove();
-  selectionDrag = undefined;
-  removeSelectionFrame();
-  pages.querySelectorAll(".custom-selection-highlight").forEach((element) => element.remove());
-  selectedTextItems = [];
-  window.getSelection()?.removeAllRanges();
-}
-
-function removeSelectionFrame(): void {
-  selectionFrame?.overlay.remove();
-  selectionFrame = undefined;
-}
-
-async function updateSearch(rawQuery: string): Promise<void> {
-  const query = safeText(rawQuery).trim().toLocaleLowerCase();
-  const generation = ++searchGeneration;
-  searchQuery = query;
-  matches = [];
-  activeMatch = -1;
-  clearSearchHighlights();
-  if (!pdfDocument || !query) {
-    searchStatus.textContent = "";
-    return;
-  }
-
-  setSearchStatus("Searching…");
-  for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
-    const text = await getPageText(pageNumber);
-    if (generation !== searchGeneration) {
-      return;
-    }
-    let pageMatchIndex = 0;
-    let index = text.indexOf(query);
-    while (index !== -1) {
-      matches.push({ page: pageNumber, index, pageMatchIndex });
-      pageMatchIndex += 1;
-      index = text.indexOf(query, index + query.length);
-    }
-  }
-
-  if (matches.length === 0) {
-    setSearchStatus("No matches");
-    return;
-  }
-  activeMatch = 0;
-  setSearchStatus(`1 of ${matches.length}`);
-  refreshSearchHighlights();
-  goToPage(matches[0].page);
 }
 
 async function getPageText(pageNumber: number): Promise<string> {
@@ -691,98 +471,6 @@ async function getPageText(pageNumber: number): Promise<string> {
   return text;
 }
 
-function moveMatch(delta: number): void {
-  if (matches.length === 0) {
-    return;
-  }
-  activeMatch = (activeMatch + delta + matches.length) % matches.length;
-  setSearchStatus(`${activeMatch + 1} of ${matches.length}`);
-  refreshSearchHighlights();
-  goToPage(matches[activeMatch].page);
-}
-
-function refreshSearchHighlights(): void {
-  for (const textLayer of pages.querySelectorAll<HTMLElement>(".textLayer")) {
-    const pageNumber = Number(textLayer.dataset.pageNumber);
-    if (Number.isFinite(pageNumber)) {
-      drawSearchHighlights(textLayer, pageNumber);
-    }
-  }
-}
-
-function clearSearchHighlights(): void {
-  pages.querySelectorAll(".search-highlight").forEach((element) => element.remove());
-}
-
-function drawSearchHighlights(textLayer: HTMLElement, pageNumber: number): void {
-  textLayer.querySelectorAll(".search-highlight").forEach((element) => element.remove());
-  if (!searchQuery) {
-    return;
-  }
-
-  const active = activeMatch >= 0 ? matches[activeMatch] : undefined;
-  const layerRect = textLayer.getBoundingClientRect();
-  const searchable = getSearchableTextFromLayer(textLayer);
-  let pageMatchIndex = 0;
-  let index = searchable.text.toLocaleLowerCase().indexOf(searchQuery);
-  while (index !== -1) {
-    const isActive = active?.page === pageNumber && active.pageMatchIndex === pageMatchIndex;
-    drawSearchMatch(textLayer, layerRect, searchable.segments, index, index + searchQuery.length, isActive);
-    pageMatchIndex += 1;
-    index = searchable.text.toLocaleLowerCase().indexOf(searchQuery, index + searchQuery.length);
-  }
-}
-
-function getSearchableTextFromLayer(textLayer: HTMLElement): { text: string; segments: SearchTextSegment[] } {
-  let text = "";
-  const segments: SearchTextSegment[] = [];
-  for (const span of textLayer.querySelectorAll<HTMLElement>("span[role='presentation']")) {
-    const spanText = span.textContent ?? "";
-    if (!spanText) {
-      continue;
-    }
-    const start = text.length;
-    text += spanText;
-    segments.push({ span, start, end: text.length });
-    text += " ";
-  }
-  return { text, segments };
-}
-
-function drawSearchMatch(
-  textLayer: HTMLElement,
-  layerRect: DOMRect,
-  segments: SearchTextSegment[],
-  start: number,
-  end: number,
-  isActive: boolean
-): void {
-  for (const segment of segments) {
-    const overlapStart = Math.max(start, segment.start);
-    const overlapEnd = Math.min(end, segment.end);
-    if (overlapStart >= overlapEnd || !segment.span.firstChild) {
-      continue;
-    }
-
-    const rect = measureTextNodeRange(
-      segment.span.firstChild,
-      overlapStart - segment.start,
-      overlapEnd - segment.start
-    ) ?? estimateTextRangeRect(segment.span, segment.span.textContent ?? "", overlapStart - segment.start, overlapEnd - segment.start);
-    if (!rect || rect.width <= 0 || rect.height <= 0) {
-      continue;
-    }
-
-    const highlight = document.createElement("div");
-    highlight.className = isActive ? "search-highlight active" : "search-highlight";
-    highlight.style.left = `${rect.left - layerRect.left}px`;
-    highlight.style.top = `${rect.top - layerRect.top}px`;
-    highlight.style.width = `${Math.max(1, rect.width)}px`;
-    highlight.style.height = `${Math.max(1, rect.height)}px`;
-    textLayer.append(highlight);
-  }
-}
-
 function updatePageControls(): void {
   const total = pdfDocument?.numPages ?? 0;
   pageNumberInput.max = String(Math.max(total, 1));
@@ -796,10 +484,6 @@ function updatePageControls(): void {
 function setStatus(message: string): void {
   statusElement.textContent = message;
   statusElement.hidden = message.length === 0;
-}
-
-function setSearchStatus(message: string): void {
-  searchStatus.textContent = message;
 }
 
 function showError(message: string): void {

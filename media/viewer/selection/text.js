@@ -1,49 +1,5 @@
 import { boxesOverlap, getPolygonBounds, polygonIntersectsBox } from "./geometry.js";
 const selectionSlopPx = 3;
-export function normalizeTextLayerSelectionOrder(container) {
-    const textSpans = Array.from(container.querySelectorAll("span[role='presentation']"));
-    if (textSpans.length < 2) {
-        return;
-    }
-    const containerRect = container.getBoundingClientRect();
-    const orderedSpans = textSpans
-        .map((span, originalIndex) => {
-        const rect = span.getBoundingClientRect();
-        return {
-            span,
-            originalIndex,
-            top: rect.top - containerRect.top,
-            left: rect.left - containerRect.left,
-            height: rect.height
-        };
-    })
-        .sort((a, b) => {
-        const lineTolerance = Math.max(3, Math.min(a.height || 0, b.height || 0) * 0.45);
-        if (Math.abs(a.top - b.top) > lineTolerance) {
-            return a.top - b.top;
-        }
-        if (Math.abs(a.left - b.left) > 1) {
-            return a.left - b.left;
-        }
-        return a.originalIndex - b.originalIndex;
-    });
-    const fragment = document.createDocumentFragment();
-    let previousTop;
-    for (const item of orderedSpans) {
-        if (previousTop !== undefined && Math.abs(item.top - previousTop) > Math.max(4, item.height * 0.6)) {
-            const lineBreak = document.createElement("br");
-            lineBreak.setAttribute("role", "presentation");
-            fragment.append(lineBreak);
-        }
-        fragment.append(item.span);
-        previousTop = item.top;
-    }
-    const endOfContent = container.querySelector(".endOfContent");
-    container.replaceChildren(fragment);
-    if (endOfContent) {
-        container.append(endOfContent);
-    }
-}
 export function applyTextSelection(textLayer, points, mode = "rectangle") {
     const layerRect = textLayer.getBoundingClientRect();
     textLayer.querySelectorAll(".custom-selection-highlight").forEach((element) => element.remove());
