@@ -1,5 +1,5 @@
 import { pointDistance } from "./selection/geometry.js";
-import { applyTextSelection, estimateTextRangeRect, measureTextNodeRange, normalizeTextLayerSelectionOrder, selectedItemsToText } from "./selection/text.js";
+import { applyTextSelection, estimateTextRangeRect, measureTextNodeRange, selectedItemsToText } from "./selection/text.js";
 import { base64ToBytes, clamp, debounce, errorMessage, requireElement, safeText } from "./shared/dom.js";
 const vscode = acquireVsCodeApi();
 const app = requireElement("app");
@@ -44,6 +44,7 @@ let renderGeneration = 0;
 let isProgrammaticScroll = false;
 let selectionMode = getInitialTextSelectionMode();
 let selectionDrag;
+let selectionFrame;
 let selectedTextItems = [];
 void initialize();
 window.addEventListener("message", (event) => {
@@ -215,12 +216,12 @@ async function renderPage(pageNumber, generation) {
             return;
         }
         pageShell.classList.remove("pending");
-        pageShell.style.width = `${Math.floor(viewport.width)}px`;
-        pageShell.style.minHeight = `${Math.floor(viewport.height)}px`;
+        const pageWidth = Math.floor(viewport.width);
+        const pageHeight = Math.floor(viewport.height);
         const pageContent = document.createElement("div");
         pageContent.className = "page-content";
-        pageContent.style.width = `${Math.floor(viewport.width)}px`;
-        pageContent.style.height = `${Math.floor(viewport.height)}px`;
+        pageContent.style.width = `${pageWidth}px`;
+        pageContent.style.height = `${pageHeight}px`;
         pageContent.style.setProperty("--scale-factor", String(effectiveScale));
         pageContent.style.setProperty("--user-unit", "1");
         pageContent.style.setProperty("--total-scale-factor", String(effectiveScale));
@@ -236,8 +237,8 @@ async function renderPage(pageNumber, generation) {
             container: textLayerContainer,
             viewport
         }).render();
-        normalizeTextLayerSelectionOrder(textLayerContainer);
         textLayerContainer.dataset.pageNumber = String(pageNumber);
+        syncPageContentScale(pageShell, pageContent, pageWidth, pageHeight);
         drawSearchHighlights(textLayerContainer, pageNumber);
         renderedPages.add(pageNumber);
         updatePageControls();
@@ -259,6 +260,27 @@ function calculateScale(viewport) {
         return clamp(Math.min((pages.clientWidth - chromePadding) / viewport.width, availableHeight / viewport.height), 0.2, 5);
     }
     return clamp(scale, 0.2, 5);
+}
+function getHorizontalPadding(element) {
+    const style = getComputedStyle(element);
+    return parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+}
+function syncPageContentScale(pageShell, pageContent, viewportWidth, viewportHeight) {
+    const pagesElement = pageShell.parentElement;
+    const availableWidth = pagesElement
+        ? pagesElement.clientWidth - getHorizontalPadding(pagesElement)
+        : viewportWidth;
+    pageContent.style.transform = "";
+    pageContent.style.transformOrigin = "top left";
+    if (viewportWidth > availableWidth && availableWidth > 0) {
+        const fitScale = availableWidth / viewportWidth;
+        pageContent.style.transform = `scale(${fitScale})`;
+        pageShell.style.width = `${Math.ceil(viewportWidth * fitScale)}px`;
+        pageShell.style.minHeight = `${Math.ceil(viewportHeight * fitScale)}px`;
+        return;
+    }
+    pageShell.style.width = `${viewportWidth}px`;
+    pageShell.style.minHeight = `${viewportHeight}px`;
 }
 function setFitMode(mode) {
     fitMode = mode;
@@ -364,24 +386,24 @@ function beginTextSelection(event) {
     event.preventDefault();
     pages.setPointerCapture(event.pointerId);
     clearTextSelection();
-    const contentRect = pageContent.getBoundingClientRect();
+    const layerRect = textLayer.getBoundingClientRect();
     const overlay = document.createElementNS(svgNamespace, "svg");
     overlay.classList.add("selection-lasso");
     overlay.classList.add(`selection-${selectionMode}`);
-    overlay.setAttribute("width", `${contentRect.width}`);
-    overlay.setAttribute("height", `${contentRect.height}`);
-    overlay.setAttribute("viewBox", `0 0 ${contentRect.width} ${contentRect.height}`);
-    const outline = document.createElementNS(svgNamespace, "polyline");
+    overlay.setAttribute("width", `${layerRect.width}`);
+    overlay.setAttribute("height", `${layerRect.height}`);
+    overlay.setAttribute("viewBox", `0 0 ${layerRect.width} ${layerRect.height}`);
+    const outline = document.createElementNS(svgNamespace, "polygon");
     outline.classList.add("selection-lasso-outline");
     overlay.append(outline);
-    pageContent.append(overlay);
+    textLayer.append(overlay);
     selectionDrag = {
         pageContent,
         textLayer,
         overlay,
         outline,
         mode: selectionMode,
-        points: [eventToSelectionPoint(event, contentRect)],
+        points: [eventToSelectionPoint(event, layerRect)],
         pageNumber: Number(textLayer.dataset.pageNumber) || 0
     };
     updateTextSelection(event);
@@ -391,8 +413,8 @@ function updateTextSelection(event) {
         return;
     }
     event.preventDefault();
-    const contentRect = selectionDrag.pageContent.getBoundingClientRect();
-    const point = eventToSelectionPoint(event, contentRect);
+    const layerRect = selectionDrag.textLayer.getBoundingClientRect();
+    const point = eventToSelectionPoint(event, layerRect);
     if (selectionDrag.mode === "rectangle") {
         selectionDrag.points[1] = point;
     }
@@ -403,14 +425,26 @@ function updateTextSelection(event) {
         }
     }
     renderSelectionOutline(selectionDrag);
-    selectedTextItems = applyTextSelection(selectionDrag.textLayer, getSelectionPolygon(selectionDrag));
+    selectedTextItems = applyTextSelection(selectionDrag.textLayer, getSelectionPolygon(selectionDrag), selectionDrag.mode);
 }
 function finishTextSelection(event) {
     if (!selectionDrag) {
         return;
     }
     event.preventDefault();
-    selectionDrag.overlay.remove();
+    const polygon = getSelectionPolygon(selectionDrag);
+    if (selectedTextItems.length > 0 && polygon.length >= 3) {
+        removeSelectionFrame();
+        renderSelectionOutline(selectionDrag, polygon);
+        selectionDrag.overlay.classList.add("selection-lasso--committed");
+        selectionFrame = {
+            pageContent: selectionDrag.pageContent,
+            overlay: selectionDrag.overlay
+        };
+    }
+    else {
+        selectionDrag.overlay.remove();
+    }
     selectionDrag = undefined;
 }
 function eventToSelectionPoint(event, contentRect) {
@@ -419,8 +453,7 @@ function eventToSelectionPoint(event, contentRect) {
         y: clamp(event.clientY - contentRect.top, 0, contentRect.height)
     };
 }
-function renderSelectionOutline(drag) {
-    const points = getSelectionPolygon(drag);
+function renderSelectionOutline(drag, points = getSelectionPolygon(drag)) {
     drag.outline.setAttribute("points", points.map((point) => `${point.x},${point.y}`).join(" "));
 }
 function getSelectionPolygon(drag) {
@@ -450,9 +483,14 @@ function copySelectedText(event) {
 function clearTextSelection() {
     selectionDrag?.overlay.remove();
     selectionDrag = undefined;
+    removeSelectionFrame();
     pages.querySelectorAll(".custom-selection-highlight").forEach((element) => element.remove());
     selectedTextItems = [];
     window.getSelection()?.removeAllRanges();
+}
+function removeSelectionFrame() {
+    selectionFrame?.overlay.remove();
+    selectionFrame = undefined;
 }
 async function updateSearch(rawQuery) {
     const query = safeText(rawQuery).trim().toLocaleLowerCase();

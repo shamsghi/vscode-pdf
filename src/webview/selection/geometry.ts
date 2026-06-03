@@ -7,6 +7,36 @@ export function pointDistance(a: SelectionPoint, b: SelectionPoint): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
+export type SelectionBounds = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
+
+export function getPolygonBounds(points: SelectionPoint[]): SelectionBounds {
+  let left = Number.POSITIVE_INFINITY;
+  let top = Number.POSITIVE_INFINITY;
+  let right = Number.NEGATIVE_INFINITY;
+  let bottom = Number.NEGATIVE_INFINITY;
+
+  for (const point of points) {
+    left = Math.min(left, point.x);
+    top = Math.min(top, point.y);
+    right = Math.max(right, point.x);
+    bottom = Math.max(bottom, point.y);
+  }
+
+  return { left, top, right, bottom };
+}
+
+export function boxesOverlap(
+  a: SelectionBounds,
+  b: SelectionBounds
+): boolean {
+  return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+}
+
 export function polygonIntersectsBox(
   points: SelectionPoint[],
   rect: { left: number; top: number; right: number; bottom: number }

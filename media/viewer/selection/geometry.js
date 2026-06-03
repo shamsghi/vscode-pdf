@@ -1,6 +1,22 @@
 export function pointDistance(a, b) {
     return Math.hypot(a.x - b.x, a.y - b.y);
 }
+export function getPolygonBounds(points) {
+    let left = Number.POSITIVE_INFINITY;
+    let top = Number.POSITIVE_INFINITY;
+    let right = Number.NEGATIVE_INFINITY;
+    let bottom = Number.NEGATIVE_INFINITY;
+    for (const point of points) {
+        left = Math.min(left, point.x);
+        top = Math.min(top, point.y);
+        right = Math.max(right, point.x);
+        bottom = Math.max(bottom, point.y);
+    }
+    return { left, top, right, bottom };
+}
+export function boxesOverlap(a, b) {
+    return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+}
 export function polygonIntersectsBox(points, rect) {
     const center = {
         x: rect.left + (rect.right - rect.left) / 2,
