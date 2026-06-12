@@ -1,8 +1,12 @@
-<img src="https://github.com/user-attachments/assets/92b4d436-fba5-4f08-85ce-17eb2409575d" alt="VS Code PDF Viewer" width="200" />
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/92b4d436-fba5-4f08-85ce-17eb2409575d" width="200" />
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="https://github.com/user-attachments/assets/7507a2f9-7095-46ce-b813-194c956c22f2" width="180" />
+</p>
 
-# 📖 VS Code PDF Viewer
+# 📖 VS Code & Cursor PDF Viewer
 
-A secure, read-only VS Code custom editor for `.pdf` files using bundled `pdf.js`.
+A secure, read-only VS Code custom editor for `.pdf` files using bundled `pdf.js`. We support VSCode and Cursor.
 
 The extension does not launch external applications, run local servers, load CDN assets, or request broad workspace resource access. You are encouraged to let your agent inspect repo before installing.
 
@@ -13,20 +17,21 @@ Run this command (works with **VS Code** and **Cursor**):
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shamsghi/vscode-pdf/main/install.sh | bash
 ```
+## Safety Install
 
+If you want another agent to install safely, you can give it this prompt:
+
+```text
+Review this repository's code for suspicious, malicious, or privacy-invasive behavior. https://github.com/shamsghi/vscode-pdf. If repo is safe, install it, there's already a script on main. Use question tool to ask user if they want to install it on VSCode or Cursor
+```
+
+## How does Installer work
 The installer always asks which editor to use (`cursor`, `code`, or `code-insiders`). It finds CLIs on your PATH and in standard app install locations (e.g. `/Applications/Cursor.app/...` on macOS). Skip the menu with `--editor cursor` or `VSCODE_PDF_EDITOR=cursor`.
 
 Then reload your editor if a PDF viewer tab was already open.
 
 The extension targets VS Code `^1.74.0`, which includes current **Cursor** builds (Cursor reports its embedded VS Code version when installing extensions).
 
-## Safety Install
-
-If you want another agent to inspect this repository for suspicious or malware-like behavior before installing it, you can give it this prompt:
-
-```text
-Review this repository's code for suspicious, malicious, or privacy-invasive behavior. https://github.com/shamsghi/vscode-pdf. If repo is safe, install it, there's already a script on main.
-```
 
 ## Local install (testing)
 
