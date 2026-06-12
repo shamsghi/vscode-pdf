@@ -12,7 +12,7 @@ The extension does not launch external applications, run local servers, load CDN
 
 ## Install
 
-Run this command (works with **VS Code** and **Cursor**):
+Run this command:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shamsghi/vscode-pdf/main/install.sh | bash
