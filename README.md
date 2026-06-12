@@ -1,4 +1,4 @@
-<img src="https://github.com/user-attachments/assets/92b4d436-fba5-4f08-85ce-17eb2409575d" alt="VS Code PDF Viewer" width="300" />
+<img src="https://github.com/user-attachments/assets/92b4d436-fba5-4f08-85ce-17eb2409575d" alt="VS Code PDF Viewer" width="200" />
 
 # 📖 VS Code PDF Viewer
 
